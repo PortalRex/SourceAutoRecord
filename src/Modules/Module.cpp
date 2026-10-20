@@ -1,5 +1,7 @@
 #include "Module.hpp"
 
+#include "Utils/LoadProfile.hpp"
+
 #include <vector>
 
 Modules::Modules()
@@ -9,6 +11,7 @@ void Modules::InitAll() {
 	for (const auto &mod : this->list) {
 		if (!mod->hasLoaded) {
 			mod->Init();
+			LoadProfile::Step(mod->Name());
 		}
 	}
 }

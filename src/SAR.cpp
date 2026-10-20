@@ -1,4 +1,5 @@
 #include "SAR.hpp"
+#include "Utils/LoadProfile.hpp"
 
 #include "Version.hpp"
 
@@ -30,6 +31,7 @@ EXPOSE_SINGLE_INTERFACE_GLOBALVAR(SAR, IServerPluginCallbacks, INTERFACEVERSION_
 
 
 bool SAR::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn gameServerFactory) {
+	LoadProfile::Begin();
 	console = new Console();
 	if (!console->Init())
 		return false;
@@ -38,6 +40,7 @@ bool SAR::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn gameServerF
 	cheats = new Cheats();
 	plugin = new Plugin();
 	game = Game::CreateNew();
+	LoadProfile::Step("console, game detection");
 
 #ifdef _WIN32
 	// The auto-updater can create this file on Windows; we should try
@@ -55,14 +58,19 @@ bool SAR::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn gameServerF
 
 	if (this->game) {
 		this->game->LoadOffsets();
+		LoadProfile::Step("LoadOffsets");
 
 		CrashHandler::Init();
+		LoadProfile::Step("CrashHandler::Init");
 
 		curl_global_init(CURL_GLOBAL_ALL);
+		LoadProfile::Step("curl_global_init");
 		InstanceIdentifier::Claim();
+		LoadProfile::Step("InstanceIdentifier::Claim");
 
 		tier1 = new Tier1();
 		if (tier1->Init()) {
+			LoadProfile::Step("tier1 init");
 			this->features->AddFeature<Cvars>(&cvars);
 			this->features->AddFeature<Session>(&session);
 			this->features->AddFeature<StepCounter>(&stepCounter);
@@ -88,6 +96,7 @@ bool SAR::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn gameServerF
 			this->features->AddFeature<TimescaleDetect>(&timescaleDetect);
 			this->features->AddFeature<PlayerTrace>(&playerTrace);
 			this->features->AddFeature<Timeline>(&timeline);
+			LoadProfile::Step("features");
 
 			this->modules->AddModule<InputSystem>(&inputSystem);
 			this->modules->AddModule<Scheme>(&scheme);
@@ -103,14 +112,18 @@ bool SAR::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn gameServerF
 			this->modules->AddModule<VPhysics>(&vphysics);
 			this->modules->AddModule<VScript>(&vscript);
 			this->modules->InitAll();
+			LoadProfile::Step("modules done");
 
 			SarInitHandler::RunAll();
+			LoadProfile::Step("init handlers done");
 
 			if (engine && engine->hasLoaded) {
 				engine->demoplayer->Init();
 				engine->demorecorder->Init();
 
+				LoadProfile::Step("demo player/recorder init");
 				this->cheats->Init();
+				LoadProfile::Step("cheats init");
 
 				this->features->AddFeature<Listener>(&listener);
 
@@ -126,17 +139,21 @@ bool SAR::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn gameServerF
 					chapterMenu->LoadMaps(this->game->GetVersion());
 				}
 				
+				LoadProfile::Step("features 2");
 				AutoSubmit::LoadApiKey(false);
+				LoadProfile::Step("LoadApiKey");
 
 				if (listener) {
 					listener->Init();
 				}
 
 				this->SearchPlugin();
+				LoadProfile::Step("listener + SearchPlugin");
 
 				console->PrintActive("Loaded SourceAutoRecord, Version %s\n", SAR_VERSION);
 
 				SeasonalASCII::Init();
+				LoadProfile::Step("rest");
 
 				return true;
 			} else {

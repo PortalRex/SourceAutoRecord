@@ -57,5 +57,9 @@ namespace RendererGpu {
 	// True while a session's queued work has not completed
 	bool Busy();
 
+	// Skip IDirect3DDevice9::Present (frames still get captured); returns
+	// false if Present couldn't be hooked
+	bool SetSkipPresent(bool skip);
+
 	void Shutdown();
 }  // namespace RendererGpu

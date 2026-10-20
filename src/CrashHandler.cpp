@@ -24,6 +24,28 @@
 static thread_local bool g_isMainThread = false;
 
 #ifdef _WIN32
+// Symbols are only needed when we crash, and loading them for every module
+// takes ~200ms, so it happens on a background thread instead of during
+// plugin_load. The handler waits for it.
+static HANDLE g_symThread;
+
+static DWORD WINAPI loadSymbols(LPVOID) {
+	HANDLE process = GetCurrentProcess();
+	SymInitialize(process, 0, true);
+	IMAGEHLP_MODULE info = {};
+	info.SizeOfStruct = sizeof(info);
+	if (SymGetModuleInfo(process, (DWORD)&Utils::GetSARPath, &info)) {
+		SymLoadModule(process, NULL, NULL, NULL, info.BaseOfImage, info.ImageSize);
+	}
+	return 0;
+}
+
+static void waitForSymbols() {
+	if (g_symThread) WaitForSingleObject(g_symThread, 10000);
+}
+#endif
+
+#ifdef _WIN32
 static LONG WINAPI handler(EXCEPTION_POINTERS *ExceptionInfo)
 #else
 static void handler(int signal, siginfo_t *info, void *ucontext)
@@ -68,6 +90,7 @@ static void handler(int signal, siginfo_t *info, void *ucontext)
 		finish;
 	}
 	faultaddr = ExceptionInfo->ExceptionRecord->ExceptionAddress;
+	waitForSymbols();
 #else
 	if (signal != SIGSEGV && signal != SIGILL && signal != SIGFPE) {
 		// We shouldn't be getting this
@@ -177,17 +200,15 @@ static PVOID g_handle = nullptr;
 void CrashHandler::Init() {
 	g_isMainThread = true;
 	g_handle = AddVectoredExceptionHandler(1, &handler);
-
-	HANDLE process = GetCurrentProcess();
-	SymInitialize(process, 0, true);
-	IMAGEHLP_MODULE info = {};
-	info.SizeOfStruct = sizeof(info);
-	if (SymGetModuleInfo(process, (DWORD)&Utils::GetSARPath, &info)) {
-		SymLoadModule(process, NULL, NULL, NULL, info.BaseOfImage, info.ImageSize);
-	}
+	g_symThread = CreateThread(NULL, 0, &loadSymbols, NULL, 0, NULL);
 }
 
 void CrashHandler::Cleanup() {
+	waitForSymbols();
+	if (g_symThread) {
+		CloseHandle(g_symThread);
+		g_symThread = NULL;
+	}
 	IMAGEHLP_MODULE info;
 	HANDLE process = GetCurrentProcess();
 	SymGetModuleInfo(process, (DWORD)&Utils::GetSARPath, &info);

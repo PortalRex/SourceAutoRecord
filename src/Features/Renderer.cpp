@@ -84,6 +84,7 @@ static Variable sar_render_threads("sar_render_threads", "0", 0, 16, "Threads us
 static Variable sar_render_nvenc_lookahead("sar_render_nvenc_lookahead", "0", 0, 32, "NVENC look-ahead depth in frames (0 = off)\n");
 static Variable sar_render_nvenc_bframes("sar_render_nvenc_bframes", "0", 0, 4, "NVENC B-frames. They make files a few percent smaller but slow renders down a lot (the GPU stalls on them)\n");
 static Variable sar_render_nvenc_multipass("sar_render_nvenc_multipass", "-1", -1, 2, "NVENC multi-pass: -1 = preset default, 0 = off, 1 = quarter resolution, 2 = full resolution\n");
+static Variable sar_render_display("sar_render_display", "0", 0, 1, "Show the frames in the game window while rendering. Off is much faster: the game window freezes until the render finishes.\n");
 static Variable sar_render_stats("sar_render_stats", "1", 0, 1, "Print timing statistics when a render finishes\n");
 
 // g_videomode VMT wrappers {{{
@@ -1095,6 +1096,7 @@ static void stopRender(bool error) {
 	}
 
 	g_render.stopError.store(error);
+	RendererGpu::SetSkipPresent(false);
 	{
 		// Wait for an audio push in flight; no more audio after this
 		std::lock_guard<std::mutex> lock(g_render.audioLock);
@@ -1468,6 +1470,7 @@ static void startRender() {
 	g_movieInfo->type = 0;  // Should stop anything actually being output
 
 	g_render.isRendering.store(true);
+	if (g_render.useGpu && !sar_render_display.GetBool()) RendererGpu::SetSkipPresent(true);
 
 	console->Print("Started rendering to '%s'\n", g_render.filename.c_str());
 

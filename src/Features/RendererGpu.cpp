@@ -14,6 +14,7 @@ void RendererGpu::Capture(int, bool, bool, bool) {}
 void RendererGpu::Finish() {}
 bool RendererGpu::Failed() { return false; }
 bool RendererGpu::Busy() { return false; }
+bool RendererGpu::SetSkipPresent(bool) { return false; }
 void RendererGpu::Shutdown() {}
 
 #else
@@ -92,6 +93,16 @@ namespace {
 	using ResetFn = HRESULT(WINAPI *)(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *);
 	ResetFn Reset_Target;
 	ResetFn Reset_Trampoline;
+
+	// While rendering, frames don't need to reach the window. Presenting
+	// them (and the driver throttling on it) was most of the render
+	// thread's time, so Present is skipped; a flush keeps the GPU fed.
+	using PresentFn = HRESULT(WINAPI *)(IDirect3DDevice9 *, const RECT *, const RECT *, HWND, const RGNDATA *);
+	PresentFn Present_Target;
+	PresentFn Present_Trampoline;
+	std::atomic<bool> g_skipPresent{false};
+	IDirect3DQuery9 *g_flushQuery;
+	IDirect3DDevice9 *g_flushQueryDevice;
 
 	template <typename T>
 	void safeRelease(T *&p) {
@@ -575,7 +586,7 @@ namespace {
 		while (g_gpu.count > 0) {
 			Slot &sl = g_gpu.slots[g_gpu.head];
 			if (sl.state != SLOT_COPYING) break;
-			if (sl.query->GetData(NULL, 0, 0) == S_FALSE) break;
+			if (sl.query->GetData(NULL, 0, D3DGETDATA_FLUSH) == S_FALSE) break;
 			readOut(sl);
 			g_gpu.head = (g_gpu.head + 1) % g_gpu.nslots;
 			--g_gpu.count;
@@ -907,7 +918,7 @@ namespace {
 				int64_t t0 = RendererCore::NowMicros();
 				while (sl.query->GetData(NULL, 0, D3DGETDATA_FLUSH) == S_FALSE) SwitchToThread();
 				g_gpu.waitUs += RendererCore::NowMicros() - t0;
-			} else if (sl.query->GetData(NULL, 0, 0) == S_FALSE) {
+			} else if (sl.query->GetData(NULL, 0, D3DGETDATA_FLUSH) == S_FALSE) {
 				break;  // keep input order
 			}
 			nvSubmit(sl);
@@ -1143,9 +1154,26 @@ namespace {
 			bool hadSession = g_gpu.active && !g_gpu.broken;
 			nvDestroy();
 			releaseSessionResources();
+			safeRelease(g_flushQuery);
+			g_flushQueryDevice = nullptr;
 			if (hadSession) fail("device reset during render");
 		}
 		return Reset_Trampoline(dev, pp);
+	}
+
+	HRESULT WINAPI Present_Hook(IDirect3DDevice9 *dev, const RECT *src, const RECT *dst, HWND wnd, const RGNDATA *dirty) {
+		if (dev != g_device || !g_skipPresent.load()) return Present_Trampoline(dev, src, dst, wnd, dirty);
+		// Submit the frame's commands without presenting it
+		if (g_flushQueryDevice != dev) {
+			safeRelease(g_flushQuery);
+			g_flushQueryDevice = dev;
+			if (FAILED(dev->CreateQuery(D3DQUERYTYPE_EVENT, &g_flushQuery))) g_flushQuery = nullptr;
+		}
+		if (g_flushQuery) {
+			g_flushQuery->Issue(D3DISSUE_END);
+			g_flushQuery->GetData(NULL, 0, D3DGETDATA_FLUSH);
+		}
+		return D3D_OK;
 	}
 
 	bool engineSupported() {
@@ -1174,6 +1202,10 @@ bool RendererGpu::CanUse(int width, int height, AVPixelFormat pixFmt, const char
 		if (MH_CreateHook((LPVOID)Reset_Target, (LPVOID)&Reset_Hook, (LPVOID *)&Reset_Trampoline) != MH_OK || MH_EnableHook((LPVOID)Reset_Target) != MH_OK) {
 			g_device = nullptr;
 			return *why = "could not hook device Reset", false;
+		}
+		Present_Target = (PresentFn)(*(void ***)g_device)[17];
+		if (MH_CreateHook((LPVOID)Present_Target, (LPVOID)&Present_Hook, (LPVOID *)&Present_Trampoline) != MH_OK || MH_EnableHook((LPVOID)Present_Target) != MH_OK) {
+			Present_Target = nullptr;  // optional; renders just keep presenting
 		}
 		console->Print("GPU capture: using D3D9 device %p (%s)\n", g_device, GetModuleHandleA("shaderapivk.dll") ? "DXVK" : "native");
 	}
@@ -1229,7 +1261,19 @@ bool RendererGpu::Busy() {
 	return g_sessionOpen.load() || g_pending.load() > 0;
 }
 
+bool RendererGpu::SetSkipPresent(bool skip) {
+	if (!Present_Target) return false;
+	g_skipPresent.store(skip);
+	return true;
+}
+
 void RendererGpu::Shutdown() {
+	g_skipPresent.store(false);
+	if (Present_Target) {
+		MH_DisableHook((LPVOID)Present_Target);
+		MH_RemoveHook((LPVOID)Present_Target);
+		Present_Target = nullptr;
+	}
 	if (Reset_Target) {
 		MH_DisableHook((LPVOID)Reset_Target);
 		MH_RemoveHook((LPVOID)Reset_Target);

@@ -168,8 +168,10 @@ static bool fileChecksum(FILE *fp, size_t ignoreEnd, uint32_t *crcOut) {
 }
 
 static uint32_t sarChecksum;
+static void waitForScan();
 
 static bool signDemo(FILE *fp, unsigned char *signature) {
+	waitForScan();  // sarChecksum
 	if (fseek(fp, 0, SEEK_END)) return false;
 
 	long size = ftell(fp);
@@ -197,6 +199,7 @@ static bool signDemo(FILE *fp, unsigned char *signature) {
 }
 
 bool AddDemoChecksum(const char *filename) {
+	waitForScan();  // sarChecksum
 	FILE *fp = fopen(filename, "ab+");  // Open for binary appending and reading
 	if (!fp) return false;
 
@@ -424,7 +427,12 @@ static bool parseVpkDirectoryTree(const std::string &vpkPath, VpkInternalData *o
 	return true;
 }
 
+// Walks the search paths and starts the checksum threads; runs in the
+// background so plugin_load doesn't wait for a full directory walk
+static std::thread g_scanThread;
+
 ON_EVENT(SAR_UNLOAD) {
+	if (g_scanThread.joinable()) g_scanThread.detach();
 	for (size_t i = 0; i < NUM_FILE_SUM_THREADS; ++i) {
 		if (g_sumthreads[i].joinable()) g_sumthreads[i].detach();
 	}
@@ -471,11 +479,16 @@ static void calcVpkInternals(std::vector<std::string> vpkPaths) {
 	}
 }
 
-static void initFileSums() {
+static void scanFileSums(std::vector<std::string> searchpaths) {
+	std::string sarPath = Utils::GetSARPath();
+	if (FILE *fp = fopen(sarPath.c_str(), "rb")) {
+		fileChecksum(fp, 0, &sarChecksum);
+		fclose(fp);
+	}
+
 	std::vector<std::string> vpkDirPaths;
 	std::vector<std::string> paths;
 	try {
-		auto searchpaths = fileSystem->GetSearchPaths();
 		for (auto searchpath : searchpaths) {
 			auto iterator = std::filesystem::recursive_directory_iterator(searchpath, std::filesystem::directory_options::follow_directory_symlink);
 			for (auto &ent : iterator) {
@@ -521,6 +534,20 @@ static void initFileSums() {
 		idx = end;
 	}
 	g_vpkThread = std::thread(calcVpkInternals, std::move(vpkDirPaths));
+}
+
+static void initFileSums() {
+	std::vector<std::string> searchpaths;
+	try {
+		searchpaths = fileSystem->GetSearchPaths();
+	} catch (...) {
+	}
+	g_scanThread = std::thread(scanFileSums, std::move(searchpaths));
+}
+
+// The scan thread creates the checksum threads; wait for it before using them
+static void waitForScan() {
+	if (g_scanThread.joinable()) g_scanThread.join();
 }
 
 static void addFileChecksum(const char *path, uint32_t sum) {
@@ -598,6 +625,7 @@ void RecordRuntimeVscriptChecksum(const char *scriptName, const char *scriptData
 }
 
 void AddDemoVpkChecksums() {
+	waitForScan();
 	if (g_vpkThread.joinable()) g_vpkThread.join();
 
 	for (auto &vpk : g_vpkInternals) {
@@ -607,6 +635,7 @@ void AddDemoVpkChecksums() {
 
 void AddDemoFileChecksums() {
 	// make sure all file sums are fully calculated first
+	waitForScan();
 	for (auto &thrd : g_sumthreads) {
 		if (thrd.joinable()) thrd.join();
 	}
@@ -619,14 +648,6 @@ void AddDemoFileChecksums() {
 }
 
 ON_INIT {
+	// Also computes sarChecksum, in the background
 	initFileSums();
-
-	std::string path = Utils::GetSARPath();
-
-	FILE *fp = fopen(path.c_str(), "rb");  // Open for binary reading
-	if (!fp) return;
-
-	fileChecksum(fp, 0, &sarChecksum);
-
-	fclose(fp);
 }
