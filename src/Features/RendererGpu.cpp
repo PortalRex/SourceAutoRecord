@@ -29,6 +29,7 @@ void RendererGpu::Shutdown() {}
 #	include <atomic>
 #	include <cstring>
 #	include <string>
+#	include <vector>
 
 #	include "RendererShaders.hpp"
 #	include "../../lib/nvenc/nvEncodeAPI.h"
@@ -143,36 +144,74 @@ namespace {
 		return true;
 	}
 
-	// Is `p` a COM object implemented by the D3D9 module that is a device?
-	IDirect3DDevice9 *probeDevice(uintptr_t p, const ModuleInfo &d3d) {
+	const char *moduleOf(uintptr_t a, char *buf, size_t n) {
+		HMODULE m = nullptr;
+		buf[0] = 0;
+		if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m) && m) {
+			char path[MAX_PATH];
+			if (GetModuleFileNameA(m, path, MAX_PATH)) {
+				const char *slash = strrchr(path, '\\');
+				snprintf(buf, n, "%s", slash ? slash + 1 : path);
+			}
+		}
+		if (!buf[0]) snprintf(buf, n, "?");
+		return buf;
+	}
+
+	// Is `p` a D3D9 device? `strict` (used when scanning unknown memory)
+	// only calls into objects whose vtable lives in the D3D9 module; a
+	// pointer from a known device global may also be wrapped/hooked.
+	IDirect3DDevice9 *probeDevice(uintptr_t p, const ModuleInfo &d3d, bool strict, const char **reason) {
 		__try {
-			if (p < 0x10000 || (p & 3)) return nullptr;
+			if (p < 0x10000 || (p & 3)) return *reason = "not a pointer", nullptr;
 			uintptr_t vt = *(uintptr_t *)p;
-			if (!d3d.image.Has(vt)) return nullptr;
+			if (strict && !d3d.image.Has(vt)) return *reason = "vtable outside the D3D9 module", nullptr;
 			uintptr_t *fns = (uintptr_t *)vt;
-			for (int i = 0; i < 3; ++i)
-				if (!d3d.InExec(fns[i])) return nullptr;
+			for (int i = 0; i < 3; ++i) {
+				if (strict && !d3d.InExec(fns[i])) return *reason = "IUnknown outside the D3D9 module", nullptr;
+				HMODULE m = nullptr;
+				if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)fns[i], &m) || !m) {
+					return *reason = "IUnknown not in any module", nullptr;
+				}
+			}
 			void *out = nullptr;
-			if (FAILED(((IUnknown *)p)->QueryInterface(__uuidof(IDirect3DDevice9), &out)) || !out) return nullptr;
+			if (FAILED(((IUnknown *)p)->QueryInterface(__uuidof(IDirect3DDevice9), &out)) || !out) return *reason = "QueryInterface(IDirect3DDevice9) failed", nullptr;
 			auto dev = (IDirect3DDevice9 *)out;
 			dev->Release();  // the game owns it; we only borrow the pointer
 			return dev;
 		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			*reason = "access violation";
 			return nullptr;
 		}
 	}
 
-	uintptr_t readPtr(uintptr_t a) {
-		__try {
-			return *(uintptr_t *)a;
-		} __except (EXCEPTION_EXECUTE_HANDLER) {
-			return 0;
+	// Pattern scan over a module's code; '?' bytes are wildcards
+	uintptr_t findPattern(const ModuleInfo &m, const char *pattern) {
+		std::vector<int> bytes;
+		for (const char *c = pattern; *c;) {
+			if (*c == ' ') {
+				++c;
+			} else if (*c == '?') {
+				bytes.push_back(-1);
+				while (*c == '?') ++c;
+			} else {
+				bytes.push_back((int)strtol(c, (char **)&c, 16));
+			}
 		}
+		for (int i = 0; i < m.nexec; ++i) {
+			const uint8_t *lo = (const uint8_t *)m.exec[i].lo, *hi = (const uint8_t *)m.exec[i].hi;
+			for (const uint8_t *q = lo; q + bytes.size() <= hi; ++q) {
+				size_t k = 0;
+				while (k < bytes.size() && (bytes[k] < 0 || q[k] == bytes[k])) ++k;
+				if (k == bytes.size()) return (uintptr_t)q;
+			}
+		}
+		return 0;
 	}
 
-	// The shader API keeps the device pointer in a global (or a global
-	// object). Scan its writable data for a pointer to a D3D9 device, one
-	// level of indirection deep at most.
+	// The shader API keeps the device in a global. Find it through the code
+	// that stores it (Portal 2 shaderapidx9/shaderapivk), falling back to
+	// scanning the shader API's data for any pointer to a device.
 	IDirect3DDevice9 *findDevice(const char **why) {
 		HMODULE shaderApi = GetModuleHandleA("shaderapivk.dll");
 		HMODULE d3dMod = nullptr;
@@ -188,22 +227,25 @@ namespace {
 			return nullptr;
 		}
 
-		for (int pass = 0; pass < 2; ++pass) {
-			for (int s = 0; s < api.ndata; ++s) {
-				for (uintptr_t a = api.data[s].lo; a + 4 <= api.data[s].hi; a += 4) {
-					uintptr_t v = *(uintptr_t *)a;
-					if (v < 0x10000 || (v & 3)) continue;
-					if (pass == 0) {
-						if (auto dev = probeDevice(v, d3d)) return dev;
-					} else if (!api.image.Has(v) && !d3d.image.Has(v)) {
-						// v may point at a heap object holding the device
-						for (uintptr_t off = 0; off < 0x200; off += 4) {
-							uintptr_t w = readPtr(v + off);
-							if (w < 0x10000 || (w & 3)) continue;
-							if (auto dev = probeDevice(w, d3d)) return dev;
-						}
-					}
-				}
+		const char *reason = "";
+		// push ebx; mov ecx,esi; call ..; push ..; mov ecx,esi; mov [g_pD3DDevice],ebx
+		uintptr_t store = findPattern(api, "53 8B CE E8 ? ? ? ? 68 ? ? ? ? 8B CE 89 1D ? ? ? ? E8 ? ? ? ? 8B 55 08");
+		if (store) {
+			uintptr_t global = *(uintptr_t *)(store + 17);
+			if (api.image.Has(global)) {
+				uintptr_t v = *(uintptr_t *)global;
+				if (auto dev = probeDevice(v, d3d, false, &reason)) return dev;
+				char a[64], b[64];
+				uintptr_t vt = v >= 0x10000 ? *(uintptr_t *)v : 0;
+				console->Print("GPU capture: device global %p -> %p (vtable %p in %s, QI in %s): %s\n", (void *)global, (void *)v, (void *)vt, moduleOf(vt, a, sizeof a), vt ? moduleOf(*(uintptr_t *)vt, b, sizeof b) : "-", reason);
+			}
+		}
+
+		for (int s = 0; s < api.ndata; ++s) {
+			for (uintptr_t a = api.data[s].lo; a + 4 <= api.data[s].hi; a += 4) {
+				uintptr_t v = *(uintptr_t *)a;
+				if (v < 0x10000 || (v & 3) || api.image.Has(v)) continue;
+				if (auto dev = probeDevice(v, d3d, true, &reason)) return dev;
 			}
 		}
 		*why = "D3D9 device not found";
@@ -359,8 +401,13 @@ namespace {
 		IDirect3DSurface9 *ds = nullptr;
 		D3DVIEWPORT9 vp;
 
-		explicit StateSave(IDirect3DDevice9 *d)
-			: dev(d) {
+		bool active;
+
+		// inactive: nothing to save (no draw calls will be made)
+		StateSave(IDirect3DDevice9 *d, bool active)
+			: dev(d)
+			, active(active) {
+			if (!active) return;
 			g_gpu.sb->Capture();
 			for (DWORD i = 0; i < 4; ++i) {
 				if (FAILED(dev->GetRenderTarget(i, &rt[i]))) rt[i] = nullptr;
@@ -369,6 +416,7 @@ namespace {
 			dev->GetViewport(&vp);
 		}
 		~StateSave() {
+			if (!active) return;
 			for (DWORD i = 0; i < 4; ++i) {
 				if (i == 0 || rt[i]) dev->SetRenderTarget(i, rt[i]);
 				else dev->SetRenderTarget(i, NULL);
@@ -703,11 +751,19 @@ namespace {
 		cfg.rcParams.targetQuality = (uint8_t)p.nvenc.cq;
 		cfg.rcParams.targetQualityLSB = 0;
 		cfg.rcParams.enableAQ = 1;
+		if (p.nvenc.multipass >= 0) {
+			cfg.rcParams.multiPass = p.nvenc.multipass == 0 ? NV_ENC_MULTI_PASS_DISABLED : p.nvenc.multipass == 1 ? NV_ENC_TWO_PASS_QUARTER_RESOLUTION : NV_ENC_TWO_PASS_FULL_RESOLUTION;
+		}
+		// Set explicitly: some presets (P7) turn look-ahead on themselves,
+		// and the output delay below has to account for it
 		int laDepth = 0;
-		if (lookahead) {
-			laDepth = 8;
+		if (lookahead && p.nvenc.lookahead > 0) {
+			laDepth = p.nvenc.lookahead;
 			cfg.rcParams.enableLookahead = 1;
 			cfg.rcParams.lookaheadDepth = (uint16_t)laDepth;
+		} else {
+			cfg.rcParams.enableLookahead = 0;
+			cfg.rcParams.lookaheadDepth = 0;
 		}
 
 		NV_ENC_CONFIG_H264_VUI_PARAMETERS *vui;
@@ -918,8 +974,10 @@ namespace {
 		if (FAILED(hr)) return fail("GetBackBuffer", hr);
 
 		{
-			StateSave save(dev);
-			setCommonState(dev);
+			// NVENC without blending only copies the back buffer
+			bool draws = !p.nvenc.enabled || p.toBlend > 1;
+			StateSave save(dev, draws);
+			if (draws) setCommonState(dev);
 
 			IDirect3DTexture9 *src = g_gpu.copyTex;
 			bool nvenc = p.nvenc.enabled;
@@ -964,9 +1022,11 @@ namespace {
 				sl.renderedTick = g_gpu.tick;
 			}
 
-			// Unbind our targets/textures before the state block restores
-			dev->SetTexture(0, NULL);
-			dev->SetTexture(1, NULL);
+			// Unbind our textures before the state block restores
+			if (draws) {
+				dev->SetTexture(0, NULL);
+				dev->SetTexture(1, NULL);
+			}
 		}
 		bb->Release();
 

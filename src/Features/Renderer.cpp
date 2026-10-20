@@ -75,12 +75,15 @@ static Variable sar_render_autostop("sar_render_autostop", "1", "Whether to auto
 static Variable sar_render_shutter_angle("sar_render_shutter_angle", "360", 30, 360, "The shutter angle to use for rendering in degrees.\n");
 static Variable sar_render_merge("sar_render_merge", "0", "When set, merge all the renders until sar_render_finish is entered\n");
 static Variable sar_render_skip_coop_videos("sar_render_skip_coop_videos", "1", "When set, don't include coop loading time in renders\n");
-static Variable sar_render_preset("sar_render_preset", "medium", "Encoder speed preset for x264/x265 (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow). Faster presets render faster but make larger files at the same quality.\n", 0);
-static Variable sar_render_vencoder("sar_render_vencoder", "", "Video encoder implementation to use instead of the default for sar_render_vcodec. nvenc = NVIDIA hardware encoding straight from the GPU (h264/hevc, native D3D9 only); auto = nvenc when available, else the default; or an FFmpeg encoder name such as libx264. Empty = default.\n", 0);
+static Variable sar_render_preset("sar_render_preset", "fast", "Encoder speed preset for x264/x265 (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow) and NVENC (mapped to P1-P7, or p1-p7 directly). Faster presets render faster but make larger files at the same quality.\n", 0);
+static Variable sar_render_vencoder("sar_render_vencoder", "auto", "Video encoder implementation. auto = NVIDIA hardware encoding straight from the GPU when available (h264/hevc, native D3D9), otherwise the default encoder for sar_render_vcodec; nvenc = same but warn when unavailable; or an FFmpeg encoder name such as libx264. Empty = the default encoder.\n", 0);
 static Variable sar_render_gop("sar_render_gop", "0", 0, "Keyframe interval in frames; 0 = 4 seconds worth of frames\n");
 static Variable sar_render_gpu("sar_render_gpu", "1", 0, 1, "Capture, blend and color-convert frames on the GPU when possible (Windows, D3D9). 0 = always use the CPU read-back path.\n");
 static Variable sar_render_queue("sar_render_queue", "8", 2, 64, "How many finished frames can wait for the encoder before the game waits for it\n");
 static Variable sar_render_threads("sar_render_threads", "0", 0, 16, "Threads used for CPU color conversion; 0 = automatic\n");
+static Variable sar_render_nvenc_lookahead("sar_render_nvenc_lookahead", "0", 0, 32, "NVENC look-ahead depth in frames (0 = off)\n");
+static Variable sar_render_nvenc_bframes("sar_render_nvenc_bframes", "0", 0, 4, "NVENC B-frames. They make files a few percent smaller but slow renders down a lot (the GPU stalls on them)\n");
+static Variable sar_render_nvenc_multipass("sar_render_nvenc_multipass", "-1", -1, 2, "NVENC multi-pass: -1 = preset default, 0 = off, 1 = quarter resolution, 2 = full resolution\n");
 static Variable sar_render_stats("sar_render_stats", "1", 0, 1, "Print timing statistics when a render finishes\n");
 
 // g_videomode VMT wrappers {{{
@@ -1295,7 +1298,8 @@ static void startRender() {
 			} else if (RendererGpu::CanUse(w, h, AV_PIX_FMT_YUV420P, &why) && RendererGpu::NvencAvailable(&why)) {
 				g_render.nvenc = true;
 			}
-			if (!g_render.nvenc) console->Print("NVENC unavailable (%s); using the default encoder\n", why ? why : "unknown");
+			bool codecOk = videoCodecId == AV_CODEC_ID_H264 || videoCodecId == AV_CODEC_ID_HEVC;
+			if (!g_render.nvenc && (venc != "auto" || codecOk)) console->Print("NVENC unavailable (%s); using the default encoder\n", why ? why : "unknown");
 		}
 	}
 
@@ -1389,16 +1393,18 @@ static void startRender() {
 		p.slots = 4;
 		p.nvenc.enabled = g_render.nvenc;
 		if (g_render.nvenc) {
-			// Same quality scale as x264's CRF; NVENC's CQ needs ~7 more for
+			// Same quality scale as x264's CRF; NVENC's CQ needs ~8 more for
 			// similar SSIM and size
 			int crf = 51 * (50 - quality) / 50;
 			p.nvenc.hevc = videoCodec->id == AV_CODEC_ID_HEVC;
-			p.nvenc.cq = std::max(1, std::min(51, crf + 7));
+			p.nvenc.cq = std::max(1, std::min(51, crf + 8));
 			p.nvenc.preset = nvencPresetFromName(sar_render_preset.GetString());
 			int gop = sar_render_gop.GetInt();
 			p.nvenc.gop = gop > 0 ? gop : g_render.fps * 4;
 			p.nvenc.fps = g_render.fps;
-			p.nvenc.bframes = 2;
+			p.nvenc.bframes = sar_render_nvenc_bframes.GetInt();
+			p.nvenc.lookahead = sar_render_nvenc_lookahead.GetInt();
+			p.nvenc.multipass = sar_render_nvenc_multipass.GetInt();
 		}
 		if (!RendererGpu::Begin(p)) {
 			if (g_render.nvenc) {
@@ -1516,12 +1522,14 @@ static void SND_RecordBuffer_Hook() {
 		}
 
 		if (++g_render.audioFill == f->nb_samples) {
+			int samples = f->nb_samples;
 			f->pts = g_render.audioPts;
-			g_render.audioPts += f->nb_samples;
+			g_render.audioPts += samples;
+			// The encoder thread owns (and may free) f from here on
 			g_render.encQueue.Push({EncItem::AUDIO, f});
 
 			Stream *a = &g_render.audioStream;
-			g_render.audioFrame = f = allocAudioFrame(AV_SAMPLE_FMT_S16P, a->enc->channel_layout, a->enc->sample_rate, f->nb_samples);
+			g_render.audioFrame = f = allocAudioFrame(AV_SAMPLE_FMT_S16P, a->enc->channel_layout, a->enc->sample_rate, samples);
 			g_render.audioFill = 0;
 			if (!f) {
 				RendererCore::ReportError("Failed to allocate audio frame!");

@@ -35,6 +35,8 @@ namespace RendererGpu {
 			int gop;
 			int fps;
 			int bframes;
+			int lookahead;  // frames, 0 = off
+			int multipass;  // -1 = preset default, 0 = off, 1 = quarter res, 2 = full res
 		} nvenc;
 	};
 
