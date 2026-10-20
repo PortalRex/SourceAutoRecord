@@ -6,19 +6,25 @@
 #include "Modules/Engine.hpp"
 #include "Modules/FileSystem.hpp"
 #include "Modules/Server.hpp"
+#include "Features/RendererGpu.hpp"
+#include "Features/RendererInternal.hpp"
 #include "Features/Session.hpp"
 #include "Utils/SDK.hpp"
 #include "Utils/Math.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -69,6 +75,13 @@ static Variable sar_render_autostop("sar_render_autostop", "1", "Whether to auto
 static Variable sar_render_shutter_angle("sar_render_shutter_angle", "360", 30, 360, "The shutter angle to use for rendering in degrees.\n");
 static Variable sar_render_merge("sar_render_merge", "0", "When set, merge all the renders until sar_render_finish is entered\n");
 static Variable sar_render_skip_coop_videos("sar_render_skip_coop_videos", "1", "When set, don't include coop loading time in renders\n");
+static Variable sar_render_preset("sar_render_preset", "medium", "Encoder speed preset for x264/x265 (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow). Faster presets render faster but make larger files at the same quality.\n", 0);
+static Variable sar_render_vencoder("sar_render_vencoder", "", "Video encoder implementation to use instead of the default for sar_render_vcodec. nvenc = NVIDIA hardware encoding straight from the GPU (h264/hevc, native D3D9 only); auto = nvenc when available, else the default; or an FFmpeg encoder name such as libx264. Empty = default.\n", 0);
+static Variable sar_render_gop("sar_render_gop", "0", 0, "Keyframe interval in frames; 0 = 4 seconds worth of frames\n");
+static Variable sar_render_gpu("sar_render_gpu", "1", 0, 1, "Capture, blend and color-convert frames on the GPU when possible (Windows, D3D9). 0 = always use the CPU read-back path.\n");
+static Variable sar_render_queue("sar_render_queue", "8", 2, 64, "How many finished frames can wait for the encoder before the game waits for it\n");
+static Variable sar_render_threads("sar_render_threads", "0", 0, 16, "Threads used for CPU color conversion; 0 = automatic\n");
+static Variable sar_render_stats("sar_render_stats", "1", 0, 1, "Print timing statistics when a render finishes\n");
 
 // g_videomode VMT wrappers {{{
 
@@ -86,29 +99,231 @@ void Renderer::ReadScreenPixels(int x, int y, int w, int h, void *buf, ImageForm
 
 // }}}
 
+// Small thread-safe containers {{{
+
+int64_t RendererCore::NowMicros() {
+	using namespace std::chrono;
+	return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// A pool of reusable objects; Acquire blocks until one is free
+template <typename T>
+class BlockingPool {
+public:
+	void Reset() {
+		std::lock_guard<std::mutex> lock(m);
+		items.clear();
+		aborted = false;
+	}
+	void Put(T item) {
+		{
+			std::lock_guard<std::mutex> lock(m);
+			items.push_back(item);
+		}
+		cv.notify_one();
+	}
+	// Returns false if aborted
+	bool Take(T &out, int64_t *stallUs = nullptr) {
+		std::unique_lock<std::mutex> lock(m);
+		if (items.empty()) {
+			int64_t t0 = RendererCore::NowMicros();
+			cv.wait(lock, [&] { return !items.empty() || aborted; });
+			if (stallUs) *stallUs += RendererCore::NowMicros() - t0;
+		}
+		if (items.empty()) return false;
+		out = items.back();
+		items.pop_back();
+		return true;
+	}
+	void Abort() {
+		{
+			std::lock_guard<std::mutex> lock(m);
+			aborted = true;
+		}
+		cv.notify_all();
+	}
+	std::vector<T> Drain() {
+		std::lock_guard<std::mutex> lock(m);
+		std::vector<T> out;
+		out.swap(items);
+		return out;
+	}
+
+private:
+	std::mutex m;
+	std::condition_variable cv;
+	std::vector<T> items;
+	bool aborted = false;
+};
+
+// An unbounded FIFO; Pop blocks until there is something
+template <typename T>
+class BlockingQueue {
+public:
+	void Push(T item) {
+		{
+			std::lock_guard<std::mutex> lock(m);
+			q.push_back(item);
+		}
+		cv.notify_one();
+	}
+	T Pop(int64_t *idleUs = nullptr) {
+		std::unique_lock<std::mutex> lock(m);
+		if (q.empty()) {
+			int64_t t0 = RendererCore::NowMicros();
+			cv.wait(lock, [&] { return !q.empty(); });
+			if (idleUs) *idleUs += RendererCore::NowMicros() - t0;
+		}
+		T item = q.front();
+		q.pop_front();
+		return item;
+	}
+
+private:
+	std::mutex m;
+	std::condition_variable cv;
+	std::deque<T> q;
+};
+
+// }}}
+
 struct Stream {
 	AVStream *stream;
 	AVCodecContext *enc;
 	AVCodec *codec;
-	AVFrame *frame, *tmpFrame;
-	SwsContext *swsCtx;
 	SwrContext *swrCtx;
-	int nextPts;
+	int64_t nextPts;
 };
 
-enum class WorkerMsg {
-	NONE,
-	VIDEO_FRAME_READY,
-	AUDIO_FRAME_READY,
-	STOP_RENDERING_ERROR,
-	STOP_RENDERING_REQUESTED,
+// Work for the encoder thread, in submission order
+struct EncItem {
+	enum Type { VIDEO, AUDIO, END, PACKET, HEADER } type;
+	AVFrame *frame;
+	AVPacket *pkt = nullptr;  // PACKET: compressed video; HEADER: extradata
+};
+
+// Work for the CPU conversion thread (read-back path only)
+struct ConvItem {
+	enum Type { FRAME, END } type;
+	uint8_t *pixels;  // BGRX, width * height * 4
+	bool accumulate;
+	bool emit;
+	int subframe;
+};
+
+// Splits RGB -> YUV conversion of one frame into horizontal bands that are
+// converted in parallel, each with its own swscale context.
+class BandConverter {
+public:
+	bool Init(int w, int h, AVPixelFormat src, AVPixelFormat dst, int bands) {
+		this->w = w;
+		this->h = h;
+		const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(dst);
+		vshift = desc ? desc->log2_chroma_h : 1;
+		nplanes = av_pix_fmt_count_planes(dst);
+		int align = 2;
+		bands = std::max(1, std::min(bands, h / 16));
+		for (int i = 0; i < bands; ++i) {
+			int y0 = (h * i / bands) & ~(align - 1);
+			int y1 = i == bands - 1 ? h : ((h * (i + 1) / bands) & ~(align - 1));
+			bandY.push_back(y0);
+			bandH.push_back(y1 - y0);
+			SwsContext *ctx = sws_getContext(w, y1 - y0, src, w, y1 - y0, dst, SWS_BILINEAR, NULL, NULL, NULL);
+			if (!ctx) return false;
+			// RGB is full range; output BT.709 limited range (tagged on the stream)
+			const int *coeffs = sws_getCoefficients(SWS_CS_ITU709);
+			sws_setColorspaceDetails(ctx, coeffs, 1, coeffs, 0, 0, 1 << 16, 1 << 16);
+			ctxs.push_back(ctx);
+		}
+		for (size_t i = 1; i < ctxs.size(); ++i) {
+			threads.emplace_back(&BandConverter::Worker, this, (int)i);
+		}
+		return true;
+	}
+
+	void Destroy() {
+		{
+			std::lock_guard<std::mutex> lock(m);
+			quit = true;
+		}
+		cvStart.notify_all();
+		for (auto &t : threads) t.join();
+		threads.clear();
+		for (auto c : ctxs) sws_freeContext(c);
+		ctxs.clear();
+		bandY.clear();
+		bandH.clear();
+		quit = false;
+	}
+
+	void Convert(const uint8_t *src, int srcStride, AVFrame *dst) {
+		this->src = src;
+		this->srcStride = srcStride;
+		this->dst = dst;
+		{
+			std::lock_guard<std::mutex> lock(m);
+			pending = (int)ctxs.size() - 1;
+			++generation;
+		}
+		cvStart.notify_all();
+		Run(0);
+		std::unique_lock<std::mutex> lock(m);
+		cvDone.wait(lock, [&] { return pending == 0; });
+	}
+
+private:
+	void Run(int i) {
+		const uint8_t *srcSlice[1] = {src + (size_t)bandY[i] * srcStride};
+		int srcLines[1] = {srcStride};
+		uint8_t *dstSlice[4] = {};
+		int dstLines[4] = {};
+		for (int p = 0; p < nplanes; ++p) {
+			int y = p == 0 ? bandY[i] : (bandY[i] >> vshift);
+			dstSlice[p] = dst->data[p] + (size_t)y * dst->linesize[p];
+			dstLines[p] = dst->linesize[p];
+		}
+		sws_scale(ctxs[i], srcSlice, srcLines, 0, bandH[i], dstSlice, dstLines);
+	}
+
+	void Worker(int i) {
+		int seen = 0;
+		while (true) {
+			std::unique_lock<std::mutex> lock(m);
+			cvStart.wait(lock, [&] { return quit || generation != seen; });
+			if (quit) return;
+			seen = generation;
+			lock.unlock();
+			Run(i);
+			lock.lock();
+			if (--pending == 0) cvDone.notify_one();
+		}
+	}
+
+	int w = 0, h = 0, vshift = 1, nplanes = 3;
+	std::vector<SwsContext *> ctxs;
+	std::vector<int> bandY, bandH;
+	std::vector<std::thread> threads;
+	std::mutex m;
+	std::condition_variable cvStart, cvDone;
+	int generation = 0, pending = 0;
+	bool quit = false;
+	const uint8_t *src = nullptr;
+	int srcStride = 0;
+	AVFrame *dst = nullptr;
 };
 
 // The global renderer state
 static struct
 {
+	// isRendering: frames/audio are being captured. sessionActive: an output
+	// file is open (it stays set until the encoder thread has written it).
 	std::atomic<bool> isRendering;
 	std::atomic<bool> isPaused;
+	std::atomic<bool> sessionActive;
+	std::atomic<bool> failed;
+	std::atomic<bool> stopError;
+	bool useGpu;
+
 	int fps;
 	int samplerate;
 	int channels;
@@ -117,42 +332,124 @@ static struct
 	std::string filename;
 	AVFormatContext *outCtx;
 	int width, height;
+	AVPixelFormat pixFmt;
 
-	// The audio stream's temporary frame needs nb_samples worth of
-	// audio before we resample and submit, so we keep track of how far
-	// in we are with this
-	int16_t *audioBuf[8];  // Temporary buffer - contains the planar audio info from the game
-	size_t audioBufSz;
-	size_t audioBufIdx;
+	// NVENC: video arrives compressed; the file header waits for its
+	// extradata, and audio waits for the header
+	bool nvenc;
+	bool headerWritten;
+	std::vector<AVFrame *> pendingAudio;  // encoder thread only
+	std::string encoderName;
 
-	// This buffer stores the image data
-	uint8_t *imageBuf;  // Temporary buffer - contains the raw pixel data read from the screen
+	// Audio: the encoder needs frame_size samples per frame, so we collect
+	// samples from the game until we have a full frame
+	std::mutex audioLock;
+	AVFrame *audioFrame;  // S16P, being filled
+	int audioFill;
+	int64_t audioPts;
 
+	// Blending
 	int toBlend;
-	int toBlendStart;       // Inclusive
-	int toBlendEnd;         // Exclusive
-	int nextBlendIdx;       // How many frames in this blend have we seen so far?
-	uint32_t *blendSumBuf;  // Blending buffer - contains the sum of the pixel values during blending (we only divide at the end of the blend to prevent rounding errors). Not allocated if toBlend == 1.
-	uint32_t totalBlendWeight;
+	int toBlendStart;  // Inclusive
+	int toBlendEnd;    // Exclusive
+	int nextBlendIdx;  // Main thread: which subframe of the current output frame is next
+	std::vector<float> blendWeights;     // normalized, per subframe
+	std::vector<uint32_t> blendWeights16;  // same, fixed point (sum = 65536)
 
-	// Synchronisation
-	std::thread worker;
-	std::mutex workerUpdateLock;
-	std::condition_variable workerUpdate;
-	std::atomic<WorkerMsg> workerMsg;
-	std::mutex imageBufLock;
-	std::mutex audioBufLock;
-	std::atomic<bool> workerFailedToStart;
+	// Video frames: pool of encoder input frames
+	BlockingPool<AVFrame *> framePool;
+	std::vector<AVFrame *> allFrames;
+	int64_t videoPts;  // assigned at submit (producer order)
+
+	// Encoder thread
+	std::thread encoder;
+	BlockingQueue<EncItem> encQueue;
+
+	// CPU read-back path: main thread reads into raw buffers, conversion
+	// thread blends + converts them
+	std::thread converter;
+	BlockingQueue<ConvItem> convQueue;
+	BlockingPool<uint8_t *> rawPool;
+	std::vector<uint8_t *> allRaw;
+	std::vector<uint32_t> blendSum;  // conversion thread only
+	uint8_t *blendOut;
+	BandConverter bands;
+
+	// Stats (microseconds)
+	int64_t startTime;
+	std::atomic<int64_t> captureUs;    // main/render thread capture work
+	std::atomic<int64_t> stallUs;      // producers waiting for a free frame
+	std::atomic<int64_t> convertUs;    // CPU conversion
+	std::atomic<int64_t> encodeUs;     // encoder thread busy
+	std::atomic<int64_t> encodeIdleUs; // encoder thread waiting for work
+	std::atomic<int> framesCaptured;
+	std::string errorMsg;
+	std::mutex errorLock;
 } g_render;
 
-ON_EVENT(SAR_UNLOAD) {
-	if (g_render.worker.joinable()) g_render.worker.detach();
+void RendererCore::AddCaptureTime(int64_t us) {
+	g_render.captureUs += us;
+}
+void RendererCore::AddStallTime(int64_t us) {
+	g_render.stallUs += us;
 }
 
-static inline void msgStopRender(bool error) {
-	std::lock_guard<std::mutex> lock(g_render.workerUpdateLock);
-	g_render.workerMsg.store(error ? WorkerMsg::STOP_RENDERING_ERROR : WorkerMsg::STOP_RENDERING_REQUESTED);
-	g_render.workerUpdate.notify_all();
+void RendererCore::ReportError(const char *msg) {
+	{
+		std::lock_guard<std::mutex> lock(g_render.errorLock);
+		if (g_render.errorMsg.empty()) g_render.errorMsg = msg;
+	}
+	g_render.failed.store(true);
+}
+
+AVFrame *RendererCore::AcquireVideoFrame() {
+	AVFrame *f = nullptr;
+	int64_t stall = 0;
+	if (!g_render.framePool.Take(f, &stall)) return nullptr;
+	g_render.stallUs += stall;
+	// The encoder may still hold a reference to this frame's buffers
+	if (av_frame_make_writable(f) < 0) {
+		g_render.framePool.Put(f);
+		ReportError("Failed to make video frame writable");
+		return nullptr;
+	}
+	return f;
+}
+
+void RendererCore::SubmitVideoFrame(AVFrame *frame) {
+	frame->pts = g_render.videoPts++;
+	++g_render.framesCaptured;
+	g_render.encQueue.Push({EncItem::VIDEO, frame});
+}
+
+void RendererCore::ReturnVideoFrame(AVFrame *frame) {
+	g_render.framePool.Put(frame);
+}
+
+void RendererCore::SubmitEnd() {
+	g_render.encQueue.Push({EncItem::END, nullptr});
+}
+
+void RendererCore::SubmitVideoHeader(const uint8_t *data, int size) {
+	AVPacket *pkt = av_packet_alloc();
+	if (!pkt || av_new_packet(pkt, size) < 0) {
+		av_packet_free(&pkt);
+		ReportError("Out of memory");
+		return;
+	}
+	memcpy(pkt->data, data, size);
+	g_render.encQueue.Push({EncItem::HEADER, nullptr, pkt});
+}
+
+void RendererCore::SubmitVideoPacket(AVPacket *pkt) {
+	++g_render.framesCaptured;
+	g_render.encQueue.Push({EncItem::PACKET, nullptr, pkt});
+}
+
+ON_EVENT(SAR_UNLOAD) {
+	if (g_render.encoder.joinable()) g_render.encoder.detach();
+	if (g_render.converter.joinable()) g_render.converter.detach();
+	RendererGpu::Shutdown();
 }
 
 // Utilities {{{
@@ -175,28 +472,44 @@ static AVCodecID audioCodecFromName(const char *name) {
 	return AV_CODEC_ID_NONE;
 }
 
-static uint16_t calcFrameWeight(double position) {
-	int mode = sar_render_blend_mode.GetInt();
-	if (mode == 0) {
-		// Linear
-		return 1;
-	} else if (mode == 1) {
+static double calcFrameWeight(int mode, double position) {
+	if (mode == 1) {
 		// Gaussian
-
 		const double mean = 0.0;
 		const double stdDev = 1.0;
+		const double variance = stdDev * stdDev;
+		double x = position * 2.0 - 1.0;  // rescale to [-1,1]
+		return 1.0 / (stdDev * sqrt(M_PI)) * exp(-(((x - mean) * (x - mean)) / (2 * variance)));
+	}
+	// Linear
+	return 1.0;
+}
 
-		const double variance = stdDev*stdDev;
+// Fills g_render.blendWeights / blendWeights16 for the current blend settings
+static void computeBlendWeights() {
+	int mode = sar_render_blend_mode.GetInt();
+	int n = g_render.toBlendEnd - g_render.toBlendStart;
+	g_render.blendWeights.assign(g_render.toBlend, 0.0f);
+	g_render.blendWeights16.assign(g_render.toBlend, 0);
 
-		// I'm pretty sure srcdemo2's formula here is wrong. This is a
-		// *correct* Gaussian weighting!
-
-		double x = position * 2.0 - 1.0; // rescale to [-1,1]
-		double w = 1.0/(stdDev * sqrt(M_PI)) * exp(-(((x - mean) * (x - mean)) / (2 * variance)));
-		return (uint16_t)(w * 16000.0); // theoretically 16384 but this protects against dodgy precision stuff
+	std::vector<double> w(g_render.toBlend, 0.0);
+	double total = 0.0;
+	for (int i = g_render.toBlendStart; i < g_render.toBlendEnd; ++i) {
+		double pos = n > 1 ? (double)(i - g_render.toBlendStart) / (n - 1) : 0.5;
+		w[i] = calcFrameWeight(mode, pos);
+		total += w[i];
 	}
 
-	return 1;
+	uint32_t sum16 = 0;
+	int last = g_render.toBlendEnd - 1;
+	for (int i = g_render.toBlendStart; i < g_render.toBlendEnd; ++i) {
+		g_render.blendWeights[i] = (float)(w[i] / total);
+		if (i != last) {
+			g_render.blendWeights16[i] = (uint32_t)(w[i] / total * 65536.0 + 0.5);
+			sum16 += g_render.blendWeights16[i];
+		}
+	}
+	g_render.blendWeights16[last] = 65536 - sum16;
 }
 
 // }}}
@@ -227,58 +540,52 @@ static void endmovie_cbk(const CCommand &args) {
 
 // }}}
 
-// AVFrame allocators {{{
-
-static AVFrame *allocPicture(AVPixelFormat pixFmt, int width, int height) {
-	AVFrame *picture = av_frame_alloc();
-	if (!picture) {
-		return NULL;
-	}
-
-	picture->format = pixFmt;
-	picture->width = width;
-	picture->height = height;
-
-	if (av_frame_get_buffer(picture, 32) < 0) {
-		THREAD_PRINT("Failed to allocate frame data\n");
-		av_frame_free(&picture);
-		return NULL;
-	}
-
-	return picture;
-}
-
-static AVFrame *allocAudioFrame(AVSampleFormat sampleFmt, uint64_t channelLayout, int sampleRate, int nbSamples) {
-	AVFrame *frame = av_frame_alloc();
-	if (!frame) {
-		return NULL;
-	}
-
-	frame->format = sampleFmt;
-	frame->channel_layout = channelLayout;
-	frame->sample_rate = sampleRate;
-	frame->nb_samples = nbSamples;
-
-	if (nbSamples) {
-		if (av_frame_get_buffer(frame, 0) < 0) {
-			return NULL;
-		}
-	}
-
-	return frame;
-}
-
-// }}}
-
 // Stream creation and destruction {{{
 
-// framerate is sample rate for audio streams
-static bool addStream(Stream *out, AVFormatContext *outputCtx, AVCodecID codecId, int64_t bitrate, int framerate, int ptsOff, int width = 0, int height = 0) {
-	out->codec = avcodec_find_encoder(codecId);
-	if (!out->codec) {
-		THREAD_PRINT("Failed to find encoder for '%s'!\n", avcodec_get_name(codecId));
-		return false;
+static AVCodec *findVideoEncoder(AVCodecID codecId) {
+	const char *name = sar_render_vencoder.GetString();
+	if (name && *name) {
+		AVCodec *c = avcodec_find_encoder_by_name(name);
+		if (!c || c->type != AVMEDIA_TYPE_VIDEO) {
+			console->Print("Unknown video encoder '%s'; using the default for %s\n", name, avcodec_get_name(codecId));
+		} else {
+			return c;
+		}
 	}
+	return avcodec_find_encoder(codecId);
+}
+
+static AVPixelFormat chooseVideoPixFmt(AVCodec *codec) {
+	if (codec->id == AV_CODEC_ID_DNXHD) return AV_PIX_FMT_YUV422P;
+	if (!codec->pix_fmts) return AV_PIX_FMT_YUV420P;
+	for (const AVPixelFormat *p = codec->pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+		if (*p == AV_PIX_FMT_YUV420P) return AV_PIX_FMT_YUV420P;
+	}
+	for (const AVPixelFormat *p = codec->pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+		if (*p == AV_PIX_FMT_NV12) return AV_PIX_FMT_NV12;
+	}
+	return codec->pix_fmts[0];
+}
+
+// x264-style preset name -> NVENC P1..P7
+static int nvencPresetFromName(const char *name) {
+	static const struct {
+		const char *name;
+		int p;
+	} map[] = {{"ultrafast", 1}, {"superfast", 2}, {"veryfast", 3}, {"faster", 3}, {"fast", 4}, {"medium", 5}, {"slow", 6}, {"slower", 7}, {"veryslow", 7}};
+	for (auto &m : map)
+		if (!strcmp(name, m.name)) return m.p;
+	if (name[0] == 'p' || name[0] == 'P') {
+		int p = atoi(name + 1);
+		if (p >= 1 && p <= 7) return p;
+	}
+	return 5;
+}
+
+// framerate is sample rate for audio streams
+static bool addStream(Stream *out, AVFormatContext *outputCtx, AVCodec *codec, int64_t bitrate, int framerate, int64_t ptsOff, int width = 0, int height = 0) {
+	out->codec = codec;
+	AVCodecID codecId = codec->id;
 
 	// dnxhd bitrate selection {{{
 
@@ -292,57 +599,23 @@ static bool addStream(Stream *out, AVFormatContext *outputCtx, AVCodecID codecId
 		size_t nrates;
 
 		if (width == 1920 && height == 1080) {  // 1080p 16:9
-			static int64_t rates1080[] = {
-				36,
-				45,
-				75,
-				90,
-				115,
-				120,
-				145,
-				175,
-				180,
-				190,
-				220,
-				240,
-				365,
-				440,
-			};
+			static int64_t rates1080[] = {36, 45, 75, 90, 115, 120, 145, 175, 180, 190, 220, 240, 365, 440};
 			rates = rates1080;
 			nrates = sizeof rates1080 / sizeof rates1080[0];
 		} else if (width == 1280 && height == 720) {  // 720p 16:9
-			static int64_t rates720[] = {
-				60,
-				75,
-				90,
-				110,
-				120,
-				145,
-				180,
-				220,
-			};
+			static int64_t rates720[] = {60, 75, 90, 110, 120, 145, 180, 220};
 			rates = rates720;
 			nrates = sizeof rates720 / sizeof rates720[0];
 		} else if (width == 1440 && height == 1080) {  // 1080p 4:3
-			static int64_t rates1080[] = {
-				63,
-				84,
-				100,
-				110,
-			};
+			static int64_t rates1080[] = {63, 84, 100, 110};
 			rates = rates1080;
 			nrates = sizeof rates1080 / sizeof rates1080[0];
 		} else if (width == 960 && height == 720) {  // 720p 4:3
-			static int64_t rates720[] = {
-				42,
-				60,
-				75,
-				115,
-			};
+			static int64_t rates720[] = {42, 60, 75, 115};
 			rates = rates720;
 			nrates = sizeof rates720 / sizeof rates720[0];
 		} else {
-			THREAD_PRINT("Resolution not supported by dnxhd\n");
+			console->Print("Resolution not supported by dnxhd\n");
 			return false;
 		}
 
@@ -354,11 +627,12 @@ static bool addStream(Stream *out, AVFormatContext *outputCtx, AVCodecID codecId
 			int64_t delta = rate > bitrate ? rate - bitrate : bitrate - rate;
 			if (delta < lastDelta) {
 				realBitrate = rate;
+				lastDelta = delta;
 			}
 		}
 
 		if (realBitrate != bitrate) {
-			THREAD_PRINT("dnxhd does not support the given bitrate; encoding at %d kb/s instead\n", realBitrate / 1000);
+			console->Print("dnxhd does not support the given bitrate; encoding at %d kb/s instead\n", (int)(realBitrate / 1000));
 			bitrate = realBitrate;
 		}
 	}
@@ -367,29 +641,29 @@ static bool addStream(Stream *out, AVFormatContext *outputCtx, AVCodecID codecId
 
 	out->stream = avformat_new_stream(outputCtx, NULL);
 	if (!out->stream) {
-		THREAD_PRINT("Failed to allocate stream\n");
+		console->Print("Failed to allocate stream\n");
 		return false;
 	}
 
-	out->enc = avcodec_alloc_context3(out->codec);
+	out->enc = avcodec_alloc_context3(codec);
 	if (!out->enc) {
-		THREAD_PRINT("Failed to allocate an encoding context\n");
+		console->Print("Failed to allocate an encoding context\n");
 		return false;
 	}
 
 	out->enc->bit_rate = bitrate;
 	out->stream->time_base = {1, framerate};
 
-	switch (out->codec->type) {
+	switch (codec->type) {
 	case AVMEDIA_TYPE_AUDIO:
-		out->enc->sample_fmt = out->codec->sample_fmts ? out->codec->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;  // don't really care about sample format
+		out->enc->sample_fmt = codec->sample_fmts ? codec->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;  // don't really care about sample format
 		out->enc->sample_rate = framerate;
 		out->enc->channel_layout = AV_CH_LAYOUT_STEREO;
 		out->enc->channels = av_get_channel_layout_nb_channels(out->enc->channel_layout);
 
-		if (out->codec->channel_layouts) {
+		if (codec->channel_layouts) {
 			bool foundStereo = false;
-			for (const uint64_t *layout = out->codec->channel_layouts; *layout; ++layout) {
+			for (const uint64_t *layout = codec->channel_layouts; *layout; ++layout) {
 				if (*layout == AV_CH_LAYOUT_STEREO) {
 					foundStereo = true;
 					break;
@@ -397,15 +671,15 @@ static bool addStream(Stream *out, AVFormatContext *outputCtx, AVCodecID codecId
 			}
 
 			if (!foundStereo) {
-				THREAD_PRINT("Stereo not supported by audio encoder\n");
+				console->Print("Stereo not supported by audio encoder\n");
 				avcodec_free_context(&out->enc);
 				return false;
 			}
 		}
 
-		if (out->codec->supported_samplerates) {
+		if (codec->supported_samplerates) {
 			bool foundRate = false;
-			for (const int *rate = out->codec->supported_samplerates; *rate; ++rate) {
+			for (const int *rate = codec->supported_samplerates; *rate; ++rate) {
 				if (*rate == framerate) {
 					foundRate = true;
 					break;
@@ -413,7 +687,7 @@ static bool addStream(Stream *out, AVFormatContext *outputCtx, AVCodecID codecId
 			}
 
 			if (!foundRate) {
-				THREAD_PRINT("Sample rate %d not supported by audio encoder\n", framerate);
+				console->Print("Sample rate %d not supported by audio encoder\n", framerate);
 				avcodec_free_context(&out->enc);
 				return false;
 			}
@@ -421,15 +695,23 @@ static bool addStream(Stream *out, AVFormatContext *outputCtx, AVCodecID codecId
 
 		break;
 
-	case AVMEDIA_TYPE_VIDEO:
+	case AVMEDIA_TYPE_VIDEO: {
 		out->enc->codec_id = codecId;
 		out->enc->width = width;
 		out->enc->height = height;
 		out->enc->time_base = out->stream->time_base;
-		out->enc->gop_size = 12;
-		out->enc->pix_fmt = codecId == AV_CODEC_ID_DNXHD ? AV_PIX_FMT_YUV422P : AV_PIX_FMT_YUV420P;
-
+		out->enc->framerate = {framerate, 1};
+		int gop = sar_render_gop.GetInt();
+		out->enc->gop_size = gop > 0 ? gop : framerate * 4;
+		out->enc->pix_fmt = chooseVideoPixFmt(codec);
+		out->enc->sample_aspect_ratio = {1, 1};
+		// Frames are converted with BT.709 coefficients, limited range
+		out->enc->color_primaries = AVCOL_PRI_BT709;
+		out->enc->color_trc = AVCOL_TRC_BT709;
+		out->enc->colorspace = AVCOL_SPC_BT709;
+		out->enc->color_range = AVCOL_RANGE_MPEG;
 		break;
+	}
 
 	default:
 		break;
@@ -446,9 +728,6 @@ static bool addStream(Stream *out, AVFormatContext *outputCtx, AVCodecID codecId
 
 static void closeStream(Stream *s) {
 	avcodec_free_context(&s->enc);
-	av_frame_free(&s->frame);
-	av_frame_free(&s->tmpFrame);
-	sws_freeContext(s->swsCtx);
 	swr_free(&s->swrCtx);
 }
 
@@ -457,6 +736,7 @@ static void closeStream(Stream *s) {
 // Flushing streams {{{
 
 static bool flushStream(Stream *s, bool isEnd = false) {
+	if (!s->enc) return true;
 	if (isEnd) {
 		avcodec_send_frame(s->enc, NULL);
 	}
@@ -480,55 +760,34 @@ static bool flushStream(Stream *s, bool isEnd = false) {
 
 // Opening streams {{{
 
-static bool openVideo(AVFormatContext *outputCtx, Stream *s, AVDictionary **options) {
+static bool openVideo(Stream *s, AVDictionary **options) {
 	if (avcodec_open2(s->enc, s->codec, options) < 0) {
-		THREAD_PRINT("Failed to open video codec\n");
-		return false;
-	}
-
-	s->frame = allocPicture(s->enc->pix_fmt, s->enc->width, s->enc->height);
-	if (!s->frame) {
-		THREAD_PRINT("Failed to allocate video frame\n");
-		return false;
-	}
-
-	s->tmpFrame = allocPicture(AV_PIX_FMT_BGR24, s->enc->width, s->enc->height);
-	if (!s->tmpFrame) {
-		THREAD_PRINT("Failed to allocate intermediate video frame\n");
+		console->Print("Failed to open video codec\n");
 		return false;
 	}
 
 	if (avcodec_parameters_from_context(s->stream->codecpar, s->enc) < 0) {
-		THREAD_PRINT("Failed to copy stream parameters\n");
-		return false;
-	}
-
-	s->swsCtx = sws_getContext(s->enc->width, s->enc->height, AV_PIX_FMT_BGR24, s->enc->width, s->enc->height, s->enc->pix_fmt, SWS_BICUBIC, NULL, NULL, NULL);
-	if (!s->swsCtx) {
-		THREAD_PRINT("Failed to initialize conversion context\n");
+		console->Print("Failed to copy stream parameters\n");
 		return false;
 	}
 
 	return true;
 }
 
-static bool openAudio(AVFormatContext *outputCtx, Stream *s, AVDictionary **options) {
+static bool openAudio(Stream *s, AVDictionary **options) {
 	if (avcodec_open2(s->enc, s->codec, options) < 0) {
-		THREAD_PRINT("Failed to open audio codec\n");
+		console->Print("Failed to open audio codec\n");
 		return false;
 	}
 
-	s->frame = allocAudioFrame(s->enc->sample_fmt, s->enc->channel_layout, s->enc->sample_rate, s->enc->frame_size);
-	s->tmpFrame = allocAudioFrame(AV_SAMPLE_FMT_S16P, s->enc->channel_layout, s->enc->sample_rate, s->enc->frame_size);
-
 	if (avcodec_parameters_from_context(s->stream->codecpar, s->enc) < 0) {
-		THREAD_PRINT("Failed to copy stream parameters\n");
+		console->Print("Failed to copy stream parameters\n");
 		return false;
 	}
 
 	s->swrCtx = swr_alloc();
 	if (!s->swrCtx) {
-		THREAD_PRINT("Failed to allocate resampler context\n");
+		console->Print("Failed to allocate resampler context\n");
 		return false;
 	}
 
@@ -540,322 +799,428 @@ static bool openAudio(AVFormatContext *outputCtx, Stream *s, AVDictionary **opti
 	av_opt_set_sample_fmt(s->swrCtx, "out_sample_fmt", s->enc->sample_fmt, 0);
 
 	if (swr_init(s->swrCtx) < 0) {
-		THREAD_PRINT("Failed to initialize resampler context\n");
+		console->Print("Failed to initialize resampler context\n");
 		return false;
 	}
 
 	return true;
 }
 
-// }}}
-
-// Worker thread {{{
-
-// workerStartRender {{{
-
-static void workerStartRender(AVCodecID videoCodec, AVCodecID audioCodec, int64_t videoBitrate, int64_t audioBitrate, AVDictionary *options) {
-	if (avformat_alloc_output_context2(&g_render.outCtx, NULL, NULL, g_render.filename.c_str()) == AVERROR(EINVAL)) {
-		THREAD_PRINT("Failed to deduce output format from file extension - using MP4\n");
-		avformat_alloc_output_context2(&g_render.outCtx, NULL, "mp4", g_render.filename.c_str());
+static AVFrame *allocAudioFrame(AVSampleFormat sampleFmt, uint64_t channelLayout, int sampleRate, int nbSamples) {
+	AVFrame *frame = av_frame_alloc();
+	if (!frame) return NULL;
+	frame->format = sampleFmt;
+	frame->channel_layout = channelLayout;
+	frame->sample_rate = sampleRate;
+	frame->nb_samples = nbSamples;
+	if (nbSamples && av_frame_get_buffer(frame, 0) < 0) {
+		av_frame_free(&frame);
+		return NULL;
 	}
-
-	if (!g_render.outCtx) {
-		THREAD_PRINT("Failed to allocate output context\n");
-		return;
-	}
-
-	if (!addStream(&g_render.videoStream, g_render.outCtx, videoCodec, videoBitrate, g_render.fps, 0, g_render.width, g_render.height)) {
-		THREAD_PRINT("Failed to create video stream\n");
-		avformat_free_context(g_render.outCtx);
-		return;
-	}
-
-	if (!addStream(&g_render.audioStream, g_render.outCtx, audioCodec, audioBitrate, g_render.samplerate, g_render.samplerate / 10)) {  // offset the start by 0.1s because idk
-		THREAD_PRINT("Failed to create audio stream\n");
-		closeStream(&g_render.videoStream);
-		avformat_free_context(g_render.outCtx);
-		return;
-	}
-
-	if (!openVideo(g_render.outCtx, &g_render.videoStream, &options)) {
-		THREAD_PRINT("Failed to open video stream\n");
-		closeStream(&g_render.audioStream);
-		closeStream(&g_render.videoStream);
-		avformat_free_context(g_render.outCtx);
-		return;
-	}
-
-	if (!openAudio(g_render.outCtx, &g_render.audioStream, &options)) {
-		THREAD_PRINT("Failed to open audio stream\n");
-		closeStream(&g_render.audioStream);
-		closeStream(&g_render.videoStream);
-		avformat_free_context(g_render.outCtx);
-		return;
-	}
-
-	if (avio_open(&g_render.outCtx->pb, g_render.filename.c_str(), AVIO_FLAG_WRITE) < 0) {
-		THREAD_PRINT("Failed to open output file\n");
-		closeStream(&g_render.audioStream);
-		closeStream(&g_render.videoStream);
-		avformat_free_context(g_render.outCtx);
-		return;
-	}
-
-	if (avformat_write_header(g_render.outCtx, &options) < 0) {
-		THREAD_PRINT("Failed to write output file\n");
-		closeStream(&g_render.audioStream);
-		closeStream(&g_render.videoStream);
-		avio_closep(&g_render.outCtx->pb);
-		avformat_free_context(g_render.outCtx);
-		return;
-	}
-
-	g_render.audioBufIdx = 0;
-	g_render.audioBufSz = g_render.audioStream.tmpFrame->nb_samples;
-
-	g_render.channels = g_render.audioStream.enc->channels;
-
-	g_render.imageBuf = (uint8_t *)malloc(3 * g_render.width * g_render.height);
-	for (int i = 0; i < g_render.channels; ++i) {
-		g_render.audioBuf[i] = (int16_t *)malloc(g_render.audioBufSz * sizeof g_render.audioBuf[i][0]);
-	}
-
-	g_render.nextBlendIdx = 0;
-	g_render.totalBlendWeight = 0;
-	if (g_render.toBlend > 1) {
-		g_render.blendSumBuf = (uint32_t *)calloc(3 * g_render.width * g_render.height, sizeof g_render.blendSumBuf[0]);
-	}
-
-	g_movieInfo->moviename[0] = 'a';  // Just something nonzero to make the game think there's a movie in progress
-	g_movieInfo->moviename[1] = 0;
-	g_movieInfo->movieframe = 0;
-	g_movieInfo->type = 0;  // Should stop anything actually being output
-
-	g_render.isRendering.store(true);
-
-	THREAD_PRINT("Started rendering to '%s'\n", g_render.filename.c_str());
-
-	THREAD_PRINT(
-		"    video: %s (%dx%d @ %d fps, %" PRId64 " kb/s, %s)\n",
-		g_render.videoStream.codec->name,
-		g_render.width,
-		g_render.height,
-		g_render.fps,
-		g_render.videoStream.enc->bit_rate / 1000,
-		av_get_pix_fmt_name(g_render.videoStream.enc->pix_fmt));
-
-	THREAD_PRINT(
-		"    audio: %s (%d Hz, %" PRId64 " kb/s, %s)\n",
-		g_render.audioStream.codec->name,
-		g_render.audioStream.enc->sample_rate,
-		g_render.audioStream.enc->bit_rate / 1000,
-		av_get_sample_fmt_name(g_render.audioStream.enc->sample_fmt));
+	return frame;
 }
 
 // }}}
 
-// workerFinishRender {{{
+// Encoder thread {{{
 
-static void workerFinishRender(bool error) {
-	if (error) {
-		THREAD_PRINT("A fatal error occurred; stopping render early\n");
-	} else {
-		THREAD_PRINT("Stopping render...\n");
+static bool encodeVideo(AVFrame *frame) {
+	if (avcodec_send_frame(g_render.videoStream.enc, frame) < 0) {
+		RendererCore::ReportError("Failed to send video frame for encoding!");
+		return false;
 	}
+	if (!flushStream(&g_render.videoStream)) {
+		RendererCore::ReportError("Failed to flush video stream!");
+		return false;
+	}
+	g_render.videoStream.nextPts = frame->pts + 1;
+	return true;
+}
 
-	g_render.isRendering.store(false);
+static bool encodeAudio(AVFrame *in) {
+	Stream *s = &g_render.audioStream;
+	AVFrame *out = allocAudioFrame(s->enc->sample_fmt, s->enc->channel_layout, s->enc->sample_rate, s->enc->frame_size ? s->enc->frame_size : in->nb_samples);
+	if (!out) {
+		RendererCore::ReportError("Failed to allocate audio frame!");
+		return false;
+	}
+	bool ok = true;
+	if (swr_convert(s->swrCtx, out->data, out->nb_samples, (const uint8_t **)in->data, in->nb_samples) < 0) {
+		RendererCore::ReportError("Failed to resample audio frame!");
+		ok = false;
+	}
+	if (ok) {
+		out->pts = av_rescale_q(in->pts, {1, s->enc->sample_rate}, s->enc->time_base);
+		if (avcodec_send_frame(s->enc, out) < 0) {
+			RendererCore::ReportError("Failed to send audio frame for encoding!");
+			ok = false;
+		} else if (!flushStream(s)) {
+			RendererCore::ReportError("Failed to flush audio stream!");
+			ok = false;
+		}
+	}
+	av_frame_free(&out);
+	return ok;
+}
 
-	flushStream(&g_render.videoStream, true);
-	flushStream(&g_render.audioStream, true);
+static void finishOutput();
 
-	av_write_trailer(g_render.outCtx);
+// NVENC: the extradata is known now, so the file header can be written
+static bool writeDeferredHeader(AVPacket *hdr) {
+	AVCodecParameters *par = g_render.videoStream.stream->codecpar;
+	par->extradata = (uint8_t *)av_mallocz(hdr->size + AV_INPUT_BUFFER_PADDING_SIZE);
+	if (!par->extradata) return false;
+	memcpy(par->extradata, hdr->data, hdr->size);
+	par->extradata_size = hdr->size;
+	if (avformat_write_header(g_render.outCtx, NULL) < 0) {
+		RendererCore::ReportError("Failed to write output file");
+		return false;
+	}
+	g_render.headerWritten = true;
+	return true;
+}
 
-	THREAD_PRINT("Rendered %d frames to '%s'\n", g_render.videoStream.nextPts, g_render.filename.c_str());
+static bool writeVideoPacket(AVPacket *pkt) {
+	Stream *v = &g_render.videoStream;
+	av_packet_rescale_ts(pkt, {1, g_render.fps}, v->stream->time_base);
+	pkt->duration = av_rescale_q(1, {1, g_render.fps}, v->stream->time_base);
+	pkt->stream_index = v->stream->index;
+	if (av_interleaved_write_frame(g_render.outCtx, pkt) < 0) {
+		RendererCore::ReportError("Failed to write video packet!");
+		return false;
+	}
+	return true;
+}
 
-	g_render.imageBufLock.lock();
-	g_render.audioBufLock.lock();
+static void encoderThread() {
+	bool ok = true;
+	while (true) {
+		int64_t idle = 0;
+		EncItem item = g_render.encQueue.Pop(&idle);
+		g_render.encodeIdleUs += idle;
+		int64_t t0 = RendererCore::NowMicros();
+		switch (item.type) {
+		case EncItem::VIDEO:
+			// After an error we keep draining so producers never block
+			if (ok) ok = encodeVideo(item.frame);
+			g_render.framePool.Put(item.frame);
+			break;
+		case EncItem::AUDIO:
+			if (!g_render.headerWritten) {
+				g_render.pendingAudio.push_back(item.frame);
+				break;
+			}
+			if (ok) ok = encodeAudio(item.frame);
+			av_frame_free(&item.frame);
+			break;
+		case EncItem::HEADER:
+			if (ok && !g_render.headerWritten) ok = writeDeferredHeader(item.pkt);
+			av_packet_free(&item.pkt);
+			for (AVFrame *f : g_render.pendingAudio) {
+				if (ok && g_render.headerWritten) ok = encodeAudio(f);
+				av_frame_free(&f);
+			}
+			g_render.pendingAudio.clear();
+			break;
+		case EncItem::PACKET:
+			if (ok && g_render.headerWritten) ok = writeVideoPacket(item.pkt);
+			av_packet_free(&item.pkt);
+			break;
+		case EncItem::END:
+			for (AVFrame *f : g_render.pendingAudio) av_frame_free(&f);
+			g_render.pendingAudio.clear();
+			finishOutput();
+			return;
+		}
+		g_render.encodeUs += RendererCore::NowMicros() - t0;
+	}
+}
 
+// }}}
+
+// CPU read-back path: conversion thread {{{
+
+static void convEmit(const uint8_t *pixels) {
+	AVFrame *f = RendererCore::AcquireVideoFrame();
+	if (!f) return;
+	int64_t t0 = RendererCore::NowMicros();
+	g_render.bands.Convert(pixels, g_render.width * 4, f);
+	g_render.convertUs += RendererCore::NowMicros() - t0;
+	RendererCore::SubmitVideoFrame(f);
+}
+
+static void converterThread() {
+	size_t n = (size_t)g_render.width * g_render.height * 4;
+	while (true) {
+		ConvItem item = g_render.convQueue.Pop();
+		if (item.type == ConvItem::END) {
+			RendererCore::SubmitEnd();
+			return;
+		}
+
+		if (g_render.toBlend == 1) {
+			convEmit(item.pixels);
+		} else {
+			int64_t t0 = RendererCore::NowMicros();
+			uint32_t *sum = g_render.blendSum.data();
+			if (item.accumulate) {
+				uint32_t w = g_render.blendWeights16[item.subframe];
+				const uint8_t *px = item.pixels;
+				for (size_t i = 0; i < n; ++i) sum[i] += w * px[i];
+			}
+			if (item.emit) {
+				uint8_t *out = g_render.blendOut;
+				for (size_t i = 0; i < n; ++i) {
+					out[i] = (uint8_t)std::min<uint32_t>((sum[i] + 32768) >> 16, 255);
+					sum[i] = 0;
+				}
+			}
+			g_render.convertUs += RendererCore::NowMicros() - t0;
+			if (item.emit) convEmit(g_render.blendOut);
+		}
+
+		if (item.pixels) g_render.rawPool.Put(item.pixels);
+	}
+}
+
+// }}}
+
+// Start / finish {{{
+
+static void freeSession() {
+	for (AVFrame *f : g_render.allFrames) av_frame_free(&f);
+	g_render.allFrames.clear();
+	g_render.framePool.Reset();
+	for (uint8_t *p : g_render.allRaw) av_free(p);
+	g_render.allRaw.clear();
+	g_render.rawPool.Reset();
+	g_render.blendSum.clear();
+	g_render.blendSum.shrink_to_fit();
+	av_freep(&g_render.blendOut);
+	av_frame_free(&g_render.audioFrame);
+	g_render.bands.Destroy();
+}
+
+static void closeOutput(bool writeTrailer) {
+	if (writeTrailer && g_render.headerWritten) av_write_trailer(g_render.outCtx);
 	closeStream(&g_render.videoStream);
 	closeStream(&g_render.audioStream);
-	avio_closep(&g_render.outCtx->pb);
+	if (g_render.outCtx->pb) avio_closep(&g_render.outCtx->pb);
 	avformat_free_context(g_render.outCtx);
-	free(g_render.imageBuf);
-	for (int i = 0; i < g_render.channels; ++i) {
-		free(g_render.audioBuf[i]);
+	g_render.outCtx = nullptr;
+}
+
+static void printStats(int64_t wallUs, int frames) {
+	if (!sar_render_stats.GetBool() || wallUs <= 0) return;
+	auto ms = [](int64_t us) { return us / 1000.0; };
+	double secs = wallUs / 1e6;
+	console->Print("[render] %d frames in %.2fs (%.1f fps), %s path, encoder %s\n", frames, secs, frames / secs, g_render.useGpu ? "GPU" : "CPU", g_render.encoderName.c_str());
+	console->Print("[render] capture %.0fms, waited for encoder %.0fms, convert %.0fms, encode busy %.0fms (%.0f%%), encoder idle %.0fms\n",
+		ms(g_render.captureUs), ms(g_render.stallUs), ms(g_render.convertUs), ms(g_render.encodeUs), 100.0 * g_render.encodeUs / wallUs, ms(g_render.encodeIdleUs));
+}
+
+// Encoder thread, after END
+static void finishOutput() {
+	bool error = g_render.stopError.load() || g_render.failed.load();
+
+	bool wroteFile = g_render.headerWritten;
+	if (wroteFile) {
+		flushStream(&g_render.videoStream, true);
+		flushStream(&g_render.audioStream, true);
 	}
-	if (g_render.toBlend > 1) {
-		free(g_render.blendSumBuf);
+	closeOutput(true);
+	if (!wroteFile) remove(g_render.filename.c_str());
+
+	int frames = g_render.framesCaptured.load();
+	int64_t wall = RendererCore::NowMicros() - g_render.startTime;
+	std::string filename = g_render.filename;
+	std::string err;
+	{
+		std::lock_guard<std::mutex> lock(g_render.errorLock);
+		err = g_render.errorMsg;
 	}
 
-	g_render.imageBufLock.unlock();
-	g_render.audioBufLock.unlock();
+	Scheduler::OnMainThread([=]() {
+		if (!err.empty()) console->Print("%s\n", err.c_str());
+		console->Print("Rendered %d frames to '%s'\n", frames, filename.c_str());
+		printStats(wall, frames);
 
-	// Reset all the Source movieinfo struct to its default values
-	g_movieInfo->moviename[0] = 0;
-	g_movieInfo->movieframe = 0;
-	g_movieInfo->type = MovieInfo_t::FMOVIE_TGA | MovieInfo_t::FMOVIE_WAV;
-	g_movieInfo->jpeg_quality = 50;
+		if (g_render.converter.joinable()) g_render.converter.join();
+		if (g_render.encoder.joinable()) g_render.encoder.join();
+		freeSession();
 
-	Scheduler::OnMainThread([]() {
+		// Reset all the Source movieinfo struct to its default values
+		g_movieInfo->moviename[0] = 0;
+		g_movieInfo->movieframe = 0;
+		g_movieInfo->type = MovieInfo_t::FMOVIE_TGA | MovieInfo_t::FMOVIE_WAV;
+		g_movieInfo->jpeg_quality = 50;
+
+		g_render.sessionActive.store(false);
+		(void)error;
 		Event::Trigger<Event::RENDERER_FINISH>({});
 	});
 }
 
-// }}}
+// Main thread
+static void stopRender(bool error) {
+	if (!g_render.isRendering.load()) return;
 
-// workerHandleVideoFrame {{{
-
-static bool workerHandleVideoFrame() {
-	g_render.imageBufLock.lock();
-	g_render.workerMsg.store(WorkerMsg::NONE);  // It's important that we do this *after* locking the image buffer
-	size_t size = g_render.width * g_render.height * 3;
-	if (g_render.toBlend == 1) {
-		// We can just copy the data directly
-		memcpy(g_render.videoStream.tmpFrame->data[0], g_render.imageBuf, size);
-		g_render.imageBufLock.unlock();
+	if (error) {
+		console->Print("A fatal error occurred; stopping render early\n");
 	} else {
-		if (g_render.nextBlendIdx >= g_render.toBlendStart && g_render.nextBlendIdx < g_render.toBlendEnd) {
-			double framePos = (g_render.nextBlendIdx - g_render.toBlendStart) / (g_render.toBlendEnd - g_render.toBlendStart - 1);
-			uint32_t weight = calcFrameWeight(framePos);
-			for (size_t i = 0; i < size; ++i) {
-				g_render.blendSumBuf[i] += weight * (uint32_t)g_render.imageBuf[i];
-			}
-			g_render.totalBlendWeight += weight;
-		}
-		g_render.imageBufLock.unlock();
-
-		if (++g_render.nextBlendIdx != g_render.toBlend) {
-			// We've added in this frame, but not done blending yet
-			return true;
-		}
-
-		for (size_t i = 0; i < size; ++i) {
-			g_render.videoStream.tmpFrame->data[0][i] = (uint8_t)(g_render.blendSumBuf[i] / g_render.totalBlendWeight);
-			g_render.blendSumBuf[i] = 0;
-		}
-
-		g_render.nextBlendIdx = 0;
-		g_render.totalBlendWeight = 0;
+		console->Print("Stopping render...\n");
 	}
 
-	// tmpFrame is now our final frame; convert to the output format and
-	// process it
+	g_render.stopError.store(error);
+	{
+		// Wait for an audio push in flight; no more audio after this
+		std::lock_guard<std::mutex> lock(g_render.audioLock);
+		g_render.isRendering.store(false);
+	}
 
-	sws_scale(g_render.videoStream.swsCtx, (const uint8_t *const *)g_render.videoStream.tmpFrame->data, g_render.videoStream.tmpFrame->linesize, 0, g_render.height, g_render.videoStream.frame->data, g_render.videoStream.frame->linesize);
+	if (g_render.useGpu) {
+		RendererGpu::Finish();
+	} else {
+		g_render.convQueue.Push({ConvItem::END, nullptr, false, false, 0});
+	}
+}
 
-	g_render.videoStream.frame->pts = g_render.videoStream.nextPts;
+static bool openOutput(AVCodec *videoCodec, AVCodec *audioCodec, int64_t videoBitrate, int64_t audioBitrate, AVDictionary **videoOptions) {
+	g_render.outCtx = nullptr;
+	if (avformat_alloc_output_context2(&g_render.outCtx, NULL, NULL, g_render.filename.c_str()) == AVERROR(EINVAL)) {
+		console->Print("Failed to deduce output format from file extension - using MP4\n");
+		avformat_alloc_output_context2(&g_render.outCtx, NULL, "mp4", g_render.filename.c_str());
+	}
 
-	if (avcodec_send_frame(g_render.videoStream.enc, g_render.videoStream.frame) < 0) {
-		THREAD_PRINT("Failed to send video frame for encoding!\n");
+	if (!g_render.outCtx) {
+		console->Print("Failed to allocate output context\n");
 		return false;
 	}
 
-	if (!flushStream(&g_render.videoStream)) {
-		THREAD_PRINT("Failed to flush video stream!\n");
+	memset(&g_render.videoStream, 0, sizeof g_render.videoStream);
+	memset(&g_render.audioStream, 0, sizeof g_render.audioStream);
+
+	auto fail = [](const char *msg) {
+		console->Print("%s\n", msg);
+		closeOutput(false);
 		return false;
+	};
+
+	if (g_render.nvenc) {
+		// Compressed by NVENC on the render thread; no libavcodec encoder
+		Stream *v = &g_render.videoStream;
+		v->stream = avformat_new_stream(g_render.outCtx, NULL);
+		if (!v->stream) return fail("Failed to create video stream");
+		v->stream->time_base = {1, g_render.fps};
+		v->stream->avg_frame_rate = {g_render.fps, 1};
+		AVCodecParameters *par = v->stream->codecpar;
+		par->codec_type = AVMEDIA_TYPE_VIDEO;
+		par->codec_id = videoCodec->id;
+		par->width = g_render.width;
+		par->height = g_render.height;
+		par->format = AV_PIX_FMT_YUV420P;
+		par->sample_aspect_ratio = {1, 1};
+		par->color_primaries = AVCOL_PRI_BT709;
+		par->color_trc = AVCOL_TRC_BT709;
+		par->color_space = AVCOL_SPC_BT709;
+		par->color_range = AVCOL_RANGE_MPEG;
+		par->field_order = AV_FIELD_PROGRESSIVE;
+	} else if (!addStream(&g_render.videoStream, g_render.outCtx, videoCodec, videoBitrate, g_render.fps, 0, g_render.width, g_render.height)) {
+		return fail("Failed to create video stream");
 	}
 
-	++g_render.videoStream.nextPts;
+	if (!addStream(&g_render.audioStream, g_render.outCtx, audioCodec, audioBitrate, g_render.samplerate, g_render.samplerate / 10)) {  // offset the start by 0.1s because idk
+		return fail("Failed to create audio stream");
+	}
+
+	if (!g_render.nvenc && !openVideo(&g_render.videoStream, videoOptions)) {
+		return fail("Failed to open video stream");
+	}
+
+	AVDictionary *audioOptions = NULL;
+	bool audioOk = openAudio(&g_render.audioStream, &audioOptions);
+	av_dict_free(&audioOptions);
+	if (!audioOk) {
+		return fail("Failed to open audio stream");
+	}
+
+	if (avio_open(&g_render.outCtx->pb, g_render.filename.c_str(), AVIO_FLAG_WRITE) < 0) {
+		return fail("Failed to open output file");
+	}
+
+	g_render.headerWritten = false;
+	if (!g_render.nvenc) {
+		if (avformat_write_header(g_render.outCtx, NULL) < 0) {
+			return fail("Failed to write output file");
+		}
+		g_render.headerWritten = true;
+	}
 
 	return true;
 }
 
-// }}}
-
-// workerHandleAudioFrame {{{
-
-static bool workerHandleAudioFrame() {
-	g_render.audioBufLock.lock();
-	g_render.workerMsg.store(WorkerMsg::NONE);  // It's important that we do this *after* locking the audio buffer
-
-	Stream *s = &g_render.audioStream;
-	for (int i = 0; i < g_render.channels; ++i) {
-		memcpy(s->tmpFrame->data[i], g_render.audioBuf[i], g_render.audioBufSz * sizeof g_render.audioBuf[i][0]);
-	}
-	g_render.audioBufLock.unlock();
-
-
-	s->tmpFrame->pts = s->nextPts;
-	s->nextPts += s->frame->nb_samples;
-
-	if (av_frame_make_writable(s->frame) < 0) {
-		THREAD_PRINT("Failed to make audio frame writable!\n");
-		return false;
+static bool allocSession() {
+	int queue = sar_render_queue.GetInt();
+	AVCodecContext *enc = g_render.videoStream.enc;
+	for (int i = 0; enc && i < queue; ++i) {
+		AVFrame *f = av_frame_alloc();
+		if (!f) return false;
+		f->format = enc->pix_fmt;
+		f->width = enc->width;
+		f->height = enc->height;
+		f->color_primaries = enc->color_primaries;
+		f->color_trc = enc->color_trc;
+		f->colorspace = enc->colorspace;
+		f->color_range = enc->color_range;
+		if (av_frame_get_buffer(f, 64) < 0) {
+			av_frame_free(&f);
+			return false;
+		}
+		g_render.allFrames.push_back(f);
+		g_render.framePool.Put(f);
 	}
 
-	if (swr_convert(s->swrCtx, s->frame->data, s->frame->nb_samples, (const uint8_t **)s->tmpFrame->data, s->tmpFrame->nb_samples) < 0) {
-		THREAD_PRINT("Failed to resample audio frame!\n");
-		return false;
+	Stream *a = &g_render.audioStream;
+	int audioSamples = a->enc->frame_size ? a->enc->frame_size : 1024;
+	g_render.audioFrame = allocAudioFrame(AV_SAMPLE_FMT_S16P, a->enc->channel_layout, a->enc->sample_rate, audioSamples);
+	if (!g_render.audioFrame) return false;
+	g_render.audioFill = 0;
+	g_render.audioPts = a->nextPts;
+	g_render.channels = a->enc->channels;
+
+	if (!g_render.useGpu) {
+		size_t n = (size_t)g_render.width * g_render.height * 4;
+		for (int i = 0; i < 3; ++i) {
+			uint8_t *p = (uint8_t *)av_malloc(n);
+			if (!p) return false;
+			g_render.allRaw.push_back(p);
+			g_render.rawPool.Put(p);
+		}
+		if (g_render.toBlend > 1) {
+			g_render.blendSum.assign(n, 0);
+			g_render.blendOut = (uint8_t *)av_malloc(n);
+			if (!g_render.blendOut) return false;
+		}
+		int threads = sar_render_threads.GetInt();
+		if (threads <= 0) threads = std::max(1, std::min(4, g_render.height / 270));
+		if (!g_render.bands.Init(g_render.width, g_render.height, AV_PIX_FMT_BGR0, enc->pix_fmt, threads)) return false;
 	}
-
-	s->frame->pts = av_rescale_q(s->tmpFrame->pts, {1, s->enc->sample_rate}, s->enc->time_base);
-
-	if (avcodec_send_frame(s->enc, s->frame) < 0) {
-		THREAD_PRINT("Failed to send audio frame for encoding!\n");
-		return false;
-	}
-
-	if (!flushStream(s)) {
-		THREAD_PRINT("Failed to flush audio stream!\n");
-		return false;
-	}
-
 	return true;
 }
-
-// }}}
-
-static void worker(AVCodecID videoCodec, AVCodecID audioCodec, int64_t videoBitrate, int64_t audioBitrate, AVDictionary *options) {
-	workerStartRender(videoCodec, audioCodec, videoBitrate, audioBitrate, options);
-	if (!g_render.isRendering.load()) {
-		g_render.workerFailedToStart.store(true);
-		return;
-	}
-	std::unique_lock<std::mutex> lock(g_render.workerUpdateLock);
-	while (true) {
-		g_render.workerUpdate.wait(lock);
-		switch (g_render.workerMsg.load()) {
-		case WorkerMsg::VIDEO_FRAME_READY:
-			if (!workerHandleVideoFrame()) {
-				workerFinishRender(true);
-				return;
-			}
-			break;
-		case WorkerMsg::AUDIO_FRAME_READY:
-			if (!workerHandleAudioFrame()) {
-				workerFinishRender(true);
-				return;
-			}
-			break;
-		case WorkerMsg::STOP_RENDERING_ERROR:
-			workerFinishRender(true);
-			return;
-		case WorkerMsg::STOP_RENDERING_REQUESTED:
-			workerFinishRender(false);
-			return;
-		case WorkerMsg::NONE:
-			break;
-		}
-	}
-}
-
-// }}}
-
-// startRender {{{
 
 static void startRender() {
-	// We can't start rendering if we haven't stopped yet, so make sure
-	// the worker thread isn't running
-	if (g_render.worker.joinable()) {
-		g_render.worker.join();
-	}
-
-	AVDictionary *options = NULL;
-
 	if (g_render.isRendering.load()) {
 		console->Print("Already rendering\n");
 		return;
 	}
+
+	if (g_render.sessionActive.load() || RendererGpu::Busy()) {
+		console->Print("The previous render is still being finished; try again in a moment\n");
+		return;
+	}
+
+	if (g_render.encoder.joinable()) g_render.encoder.join();
+	if (g_render.converter.joinable()) g_render.converter.join();
 
 	if (!sv_cheats.GetBool()) {
 		console->Print("sv_cheats must be enabled\n");
@@ -888,27 +1253,60 @@ static void startRender() {
 		float shutter = (float)sar_render_shutter_angle.GetInt() / 360.0f;
 		int toExclude = (int)round(g_render.toBlend * (1 - shutter) / 2);
 		if (toExclude * 2 >= g_render.toBlend) {
-			toExclude = g_render.toBlend / 2 - 1;
+			toExclude = std::max(0, g_render.toBlend / 2 - 1);
 		}
 		g_render.toBlendStart = toExclude;
 		g_render.toBlendEnd = g_render.toBlend - toExclude;
 	}
+	computeBlendWeights();
 
 	if (snd_surround_speakers.GetInt() != 2) {
 		console->Print("Note: setting speaker configuration to stereo. You may wish to reset it after the render\n");
 		snd_surround_speakers.SetValue(2);
 	}
 
-	AVCodecID videoCodec = videoCodecFromName(sar_render_vcodec.GetString());
-	AVCodecID audioCodec = audioCodecFromName(sar_render_acodec.GetString());
+	AVCodecID videoCodecId = videoCodecFromName(sar_render_vcodec.GetString());
+	AVCodecID audioCodecId = audioCodecFromName(sar_render_acodec.GetString());
 
-	if (videoCodec == AV_CODEC_ID_NONE) {
+	if (videoCodecId == AV_CODEC_ID_NONE) {
 		console->Print("Unknown video codec '%s'\n", sar_render_vcodec.GetString());
 		return;
 	}
 
-	if (audioCodec == AV_CODEC_ID_NONE) {
+	if (audioCodecId == AV_CODEC_ID_NONE) {
 		console->Print("Unknown audio codec '%s'\n", sar_render_acodec.GetString());
+		return;
+	}
+
+	// NVENC straight from the game's D3D9 device?
+	g_render.nvenc = false;
+	{
+		std::string venc = sar_render_vencoder.GetString();
+		bool wantNv = venc == "nvenc" || venc == "auto" || venc == "h264_nvenc" || venc == "hevc_nvenc";
+		if (venc == "h264_nvenc") videoCodecId = AV_CODEC_ID_H264;
+		if (venc == "hevc_nvenc") videoCodecId = AV_CODEC_ID_HEVC;
+		if (wantNv) {
+			const char *why = nullptr;
+			int w = GetScreenWidth(), h = GetScreenHeight();
+			if (videoCodecId != AV_CODEC_ID_H264 && videoCodecId != AV_CODEC_ID_HEVC) {
+				why = "only h264 and hevc are supported";
+			} else if (!sar_render_gpu.GetBool()) {
+				why = "sar_render_gpu is 0";
+			} else if (RendererGpu::CanUse(w, h, AV_PIX_FMT_YUV420P, &why) && RendererGpu::NvencAvailable(&why)) {
+				g_render.nvenc = true;
+			}
+			if (!g_render.nvenc) console->Print("NVENC unavailable (%s); using the default encoder\n", why ? why : "unknown");
+		}
+	}
+
+	AVCodec *videoCodec = g_render.nvenc ? (AVCodec *)avcodec_find_decoder(videoCodecId) : findVideoEncoder(videoCodecId);
+	AVCodec *audioCodec = avcodec_find_encoder(audioCodecId);
+	if (!videoCodec) {
+		console->Print("Failed to find encoder for '%s'!\n", avcodec_get_name(videoCodecId));
+		return;
+	}
+	if (!audioCodec) {
+		console->Print("Failed to find encoder for '%s'!\n", avcodec_get_name(audioCodecId));
 		return;
 	}
 
@@ -919,6 +1317,8 @@ static void startRender() {
 	if (quality < 0) quality = 0;
 	if (quality > 50) quality = 50;
 
+	AVDictionary *options = NULL;
+
 	// Quality options
 	{
 		// TODO: CRF scales non-linearly. Do we make this conversion
@@ -926,32 +1326,144 @@ static void startRender() {
 
 		int min = 0;
 		int max = 63;
-		if (videoCodec == AV_CODEC_ID_H264 || videoCodec == AV_CODEC_ID_HEVC) {
+		if (videoCodec->id == AV_CODEC_ID_H264 || videoCodec->id == AV_CODEC_ID_HEVC) {
 			max = 51;
-		} else if (videoCodec == AV_CODEC_ID_VP8) {
+		} else if (videoCodec->id == AV_CODEC_ID_VP8) {
 			min = 4;
 		}
 		int crf = min + (max - min) * (50 - quality) / 50;
 		std::string crfStr = std::to_string(crf);
-		av_dict_set(&options, "crf", crfStr.c_str(), 0);
 
-		if (videoCodec == AV_CODEC_ID_H264 || videoCodec == AV_CODEC_ID_HEVC) {
-			av_dict_set(&options, "preset", "slower", 0);
+		const char *name = videoCodec->name;
+		if (!strcmp(name, "libx264") || !strcmp(name, "libx265")) {
+			av_dict_set(&options, "crf", crfStr.c_str(), 0);
+			av_dict_set(&options, "preset", sar_render_preset.GetString(), 0);
+		} else if (!strncmp(name, "libvpx", 6)) {
+			av_dict_set(&options, "crf", crfStr.c_str(), 0);
+		} else if (strstr(name, "_mf")) {
+			// Media Foundation: prefer the hardware encoder, quality-based
+			// rate control (0-100)
+			av_dict_set(&options, "hw_encoding", "1", 0);
+			av_dict_set(&options, "rate_control", "quality", 0);
+			av_dict_set(&options, "quality", std::to_string(quality * 2).c_str(), 0);
 		}
 	}
 
 	g_render.width = GetScreenWidth();
 	g_render.height = GetScreenHeight();
 
-	g_render.workerFailedToStart.store(false);
+	g_render.failed.store(false);
+	g_render.stopError.store(false);
+	{
+		std::lock_guard<std::mutex> lock(g_render.errorLock);
+		g_render.errorMsg.clear();
+	}
 
-	g_render.workerMsg.store(WorkerMsg::NONE);
-	g_render.worker = std::thread(worker, videoCodec, audioCodec, videoBitrate * 1000, audioBitrate * 1000, options);
+	if (!openOutput(videoCodec, audioCodec, (int64_t)(videoBitrate * 1000), (int64_t)(audioBitrate * 1000), &options)) {
+		av_dict_free(&options);
+		return;
+	}
+	av_dict_free(&options);
 
-	// Busy-wait until the rendering has started so that we don't miss
-	// any frames
-	while (!g_render.isRendering.load() && !g_render.workerFailedToStart.load())
-		;
+	AVPixelFormat pixFmt = g_render.nvenc ? AV_PIX_FMT_YUV420P : g_render.videoStream.enc->pix_fmt;
+	const char *why = nullptr;
+	g_render.useGpu = g_render.nvenc || (sar_render_gpu.GetBool() && RendererGpu::CanUse(g_render.width, g_render.height, pixFmt, &why));
+	if (sar_render_gpu.GetBool() && !g_render.useGpu && why) {
+		console->Print("GPU capture unavailable (%s); using CPU read-back\n", why);
+	}
+
+	if (!allocSession()) {
+		console->Print("Failed to allocate render buffers\n");
+		freeSession();
+		closeOutput(false);
+		return;
+	}
+
+	if (g_render.useGpu) {
+		RendererGpu::Params p;
+		p.width = g_render.width;
+		p.height = g_render.height;
+		p.pixFmt = pixFmt;
+		p.toBlend = g_render.toBlend;
+		p.weights = g_render.blendWeights;
+		p.slots = 4;
+		p.nvenc.enabled = g_render.nvenc;
+		if (g_render.nvenc) {
+			// Same quality scale as x264's CRF; NVENC's CQ needs ~7 more for
+			// similar SSIM and size
+			int crf = 51 * (50 - quality) / 50;
+			p.nvenc.hevc = videoCodec->id == AV_CODEC_ID_HEVC;
+			p.nvenc.cq = std::max(1, std::min(51, crf + 7));
+			p.nvenc.preset = nvencPresetFromName(sar_render_preset.GetString());
+			int gop = sar_render_gop.GetInt();
+			p.nvenc.gop = gop > 0 ? gop : g_render.fps * 4;
+			p.nvenc.fps = g_render.fps;
+			p.nvenc.bframes = 2;
+		}
+		if (!RendererGpu::Begin(p)) {
+			if (g_render.nvenc) {
+				console->Print("NVENC failed to start\n");
+				freeSession();
+				closeOutput(false);
+				remove(g_render.filename.c_str());
+				return;
+			}
+			console->Print("GPU capture failed to start; using CPU read-back\n");
+			g_render.useGpu = false;
+			freeSession();
+			if (!allocSession()) {
+				console->Print("Failed to allocate render buffers\n");
+				freeSession();
+				closeOutput(false);
+				return;
+			}
+		}
+	}
+
+	g_render.nextBlendIdx = 0;
+	g_render.videoPts = 0;
+	g_render.framesCaptured = 0;
+	g_render.captureUs = 0;
+	g_render.stallUs = 0;
+	g_render.convertUs = 0;
+	g_render.encodeUs = 0;
+	g_render.encodeIdleUs = 0;
+	g_render.startTime = RendererCore::NowMicros();
+
+	g_render.encoderName = g_render.nvenc ? (videoCodec->id == AV_CODEC_ID_HEVC ? "hevc_nvenc (zero-copy)" : "h264_nvenc (zero-copy)") : g_render.videoStream.codec->name;
+	g_render.sessionActive.store(true);
+	g_render.encoder = std::thread(encoderThread);
+	if (!g_render.useGpu) g_render.converter = std::thread(converterThread);
+
+	g_movieInfo->moviename[0] = 'a';  // Just something nonzero to make the game think there's a movie in progress
+	g_movieInfo->moviename[1] = 0;
+	g_movieInfo->movieframe = 0;
+	g_movieInfo->type = 0;  // Should stop anything actually being output
+
+	g_render.isRendering.store(true);
+
+	console->Print("Started rendering to '%s'\n", g_render.filename.c_str());
+
+	if (g_render.nvenc) {
+		console->Print("    video: %s (%dx%d @ %d fps, constant quality, yuv420p)\n", g_render.encoderName.c_str(), g_render.width, g_render.height, g_render.fps);
+	} else {
+		console->Print(
+			"    video: %s (%dx%d @ %d fps, %" PRId64 " kb/s, %s, %s capture)\n",
+			g_render.videoStream.codec->name,
+			g_render.width,
+			g_render.height,
+			g_render.fps,
+			g_render.videoStream.enc->bit_rate / 1000,
+			av_get_pix_fmt_name(g_render.videoStream.enc->pix_fmt),
+			g_render.useGpu ? "GPU" : "CPU");
+	}
+
+	console->Print(
+		"    audio: %s (%d Hz, %" PRId64 " kb/s, %s)\n",
+		g_render.audioStream.codec->name,
+		g_render.audioStream.enc->sample_rate,
+		g_render.audioStream.enc->bit_rate / 1000,
+		av_get_sample_fmt_name(g_render.audioStream.enc->sample_fmt));
 
 	Event::Trigger<Event::RENDERER_START>({});
 }
@@ -982,59 +1494,60 @@ static void SND_RecordBuffer_Hook() {
 
 	if (engine->ConsoleVisible()) return;
 
-	// If the worker has received a message it hasn't yet handled,
-	// busy-wait; this is a really obscure race condition that should
-	// never happen
-	while (g_render.isRendering.load() && g_render.workerMsg.load() != WorkerMsg::NONE)
-		;
-
 	if (snd_surround_speakers.GetInt() != 2) {
 		console->Print("Speaker configuration changed!\n");
-		msgStopRender(true);
+		RendererCore::ReportError("Speaker configuration changed!");
 		return;
 	}
 
-	g_render.audioBufLock.lock();
+	std::lock_guard<std::mutex> lock(g_render.audioLock);
+	if (!g_render.isRendering.load()) return;
 
-	for (int i = 0; i < *g_snd_linear_count; i += g_render.channels) {
-		for (int c = 0; c < g_render.channels; ++c) {
-			g_render.audioBuf[c][g_render.audioBufIdx] = clip16(((*g_snd_p)[i + c] * *g_snd_vol) >> 8);
+	int channels = g_render.channels;
+	AVFrame *f = g_render.audioFrame;
+	int16_t **planes = (int16_t **)f->data;
+	int count = *g_snd_linear_count;
+	int *src = *g_snd_p;
+	int vol = *g_snd_vol;
+
+	for (int i = 0; i < count; i += channels) {
+		for (int c = 0; c < channels; ++c) {
+			planes[c][g_render.audioFill] = clip16((src[i + c] * vol) >> 8);
 		}
 
-		++g_render.audioBufIdx;
-		if (g_render.audioBufIdx == g_render.audioBufSz) {
-			g_render.audioBufLock.unlock();
+		if (++g_render.audioFill == f->nb_samples) {
+			f->pts = g_render.audioPts;
+			g_render.audioPts += f->nb_samples;
+			g_render.encQueue.Push({EncItem::AUDIO, f});
 
-			g_render.workerUpdateLock.lock();
-			g_render.workerMsg.store(WorkerMsg::AUDIO_FRAME_READY);
-			g_render.workerUpdate.notify_all();
-			g_render.workerUpdateLock.unlock();
-
-			// Busy-wait until the worker locks the audio buffer; not
-			// ideal, but shouldn't take long
-			while (g_render.isRendering.load() && g_render.workerMsg.load() != WorkerMsg::NONE)
-				;
-
-			if (!g_render.isRendering.load()) {
-				// We shouldn't write to that buffer anymore, it's been
-				// invalidated
-				// We've already unlocked audioBufLock so just return
+			Stream *a = &g_render.audioStream;
+			g_render.audioFrame = f = allocAudioFrame(AV_SAMPLE_FMT_S16P, a->enc->channel_layout, a->enc->sample_rate, f->nb_samples);
+			g_render.audioFill = 0;
+			if (!f) {
+				RendererCore::ReportError("Failed to allocate audio frame!");
 				return;
 			}
-
-			g_render.audioBufLock.lock();
-			g_render.audioBufIdx = 0;
+			planes = (int16_t **)f->data;
 		}
 	}
-
-	g_render.audioBufLock.unlock();
-
-	return;
 }
 
 // }}}
 
 // Video output {{{
+
+static void captureCpu(bool accumulate, bool emit, int subframe) {
+	ConvItem item = {ConvItem::FRAME, nullptr, accumulate, emit, subframe};
+	if (accumulate) {
+		int64_t stall = 0;
+		if (!g_render.rawPool.Take(item.pixels, &stall)) return;
+		g_render.stallUs += stall;
+		int64_t t0 = RendererCore::NowMicros();
+		Renderer::ReadScreenPixels(0, 0, g_render.width, g_render.height, item.pixels, IMAGE_FORMAT_BGRX8888);
+		g_render.captureUs += RendererCore::NowMicros() - t0;
+	}
+	g_render.convQueue.Push(item);
+}
 
 void Renderer::Frame() {
 	if (Renderer::isDemoLoading && sar_render_autostart.GetBool()) {
@@ -1043,6 +1556,8 @@ void Renderer::Frame() {
 		if (engine->GetMaxClients() >= 2 && sar_render_skip_coop_videos.GetBool()) {
 			start &= engine->startedTransitionFadeout;
 		}
+		// Wait for a previous render to be written out first
+		start &= !g_render.sessionActive.load() || g_render.isRendering.load();
 		g_render.isPaused.store(!start);
 		if (!start) return;
 
@@ -1062,6 +1577,17 @@ void Renderer::Frame() {
 
 	if (!g_render.isRendering.load()) return;
 
+	if (g_render.failed.load() || (g_render.useGpu && RendererGpu::Failed())) {
+		std::string err;
+		{
+			std::lock_guard<std::mutex> lock(g_render.errorLock);
+			err = g_render.errorMsg;
+		}
+		if (!err.empty()) console->Print("%s\n", err.c_str());
+		stopRender(true);
+		return;
+	}
+
 	if (engine->GetMaxClients() >= 2 && sar_render_skip_coop_videos.GetBool() && engine->isLevelTransition) {
 		// The transition video has begun, pause the render
 		g_render.isPaused.store(true);
@@ -1071,10 +1597,9 @@ void Renderer::Frame() {
 	// autostop: if it's the __END__ tick, or the demo is over, stop
 	// rendering
 
-
 	if (sar_render_autostop.GetBool() && Renderer::segmentEndTick != -1 && engine->demoplayer->IsPlaying() && engine->demoplayer->GetTick() > Renderer::segmentEndTick) {
 		if (!sar_render_merge.GetBool())
-			msgStopRender(false);
+			stopRender(false);
 		else
 			g_render.isPaused.store(true);
 		return;
@@ -1086,49 +1611,25 @@ void Renderer::Frame() {
 	// Don't render if the console is visible
 	if (engine->ConsoleVisible()) return;
 
-	// If the worker has received a message it hasn't yet handled,
-	// busy-wait; this is a really obscure race condition that should
-	// never happen
-	while (g_render.isRendering.load() && g_render.workerMsg.load() != WorkerMsg::NONE)
-		;
-
-	if (GetScreenWidth() != g_render.width) {
+	if (GetScreenWidth() != g_render.width || GetScreenHeight() != g_render.height) {
 		console->Print("Screen resolution has changed!\n");
-		msgStopRender(true);
+		stopRender(true);
 		return;
 	}
 
-	if (GetScreenHeight() != g_render.height) {
-		console->Print("Screen resolution has changed!\n");
-		msgStopRender(true);
-		return;
-	}
+	int sub = g_render.nextBlendIdx;
+	g_render.nextBlendIdx = (sub + 1) % g_render.toBlend;
+	bool accumulate = g_render.toBlend == 1 || (sub >= g_render.toBlendStart && sub < g_render.toBlendEnd);
+	bool emit = sub == g_render.toBlend - 1;
+	// Subframes outside the shutter don't need to be captured at all
+	if (!accumulate && !emit) return;
 
-	if (av_frame_make_writable(g_render.videoStream.frame) < 0) {
-		console->Print("Failed to make video frame writable!\n");
-		msgStopRender(true);
-		return;
-	}
-
-	g_render.imageBufLock.lock();
-
-	// Double check the buffer hasn't at some point between the start of
-	// the function and now been invalidated
-	if (!g_render.isRendering.load()) {
-		g_render.imageBufLock.unlock();
-		return;
-	}
-
-	ReadScreenPixels(0, 0, g_render.width, g_render.height, g_render.imageBuf, IMAGE_FORMAT_BGR888);
-
-	g_render.imageBufLock.unlock();
-
-	// Signal to the worker thread that there is image data for it to
-	// process
-	{
-		std::lock_guard<std::mutex> lock(g_render.workerUpdateLock);
-		g_render.workerMsg.store(WorkerMsg::VIDEO_FRAME_READY);
-		g_render.workerUpdate.notify_all();
+	if (g_render.useGpu) {
+		int64_t t0 = RendererCore::NowMicros();
+		RendererGpu::Capture(sub, accumulate, sub == g_render.toBlendStart, emit);
+		g_render.captureUs += RendererCore::NowMicros() - t0;
+	} else {
+		captureCpu(accumulate, emit, sub);
 	}
 }
 
@@ -1136,7 +1637,7 @@ void Renderer::Frame() {
 
 ON_EVENT(DEMO_STOP) {
 	if (g_render.isRendering.load() && sar_render_autostop.GetBool() && !sar_render_merge.GetBool()) {
-		msgStopRender(false);
+		stopRender(false);
 	}
 }
 
@@ -1186,6 +1687,11 @@ CON_COMMAND(sar_render_start, "sar_render_start <file> - start rendering frames 
 		return;
 	}
 
+	if (g_render.isRendering.load()) {
+		console->Print("Already rendering\n");
+		return;
+	}
+
 	g_render.filename = std::string(args[1]);
 
 	startRender();
@@ -1202,7 +1708,7 @@ CON_COMMAND(sar_render_finish, "sar_render_finish - stop rendering frames\n") {
 		return;
 	}
 
-	msgStopRender(false);
+	stopRender(false);
 }
 
 // }}}
