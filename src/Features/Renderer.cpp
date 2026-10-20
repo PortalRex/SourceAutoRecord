@@ -589,14 +589,14 @@ static int nvencPresetFromName(const char *name) {
 	static const struct {
 		const char *name;
 		int p;
-	} map[] = {{"ultrafast", 1}, {"superfast", 2}, {"veryfast", 3}, {"faster", 3}, {"fast", 4}, {"medium", 5}, {"slow", 6}, {"slower", 7}, {"veryslow", 7}};
+	} map[] = {{"ultrafast", 1}, {"superfast", 2}, {"veryfast", 2}, {"faster", 3}, {"fast", 3}, {"medium", 4}, {"slow", 5}, {"slower", 6}, {"veryslow", 7}};
 	for (auto &m : map)
 		if (!strcmp(name, m.name)) return m.p;
 	if (name[0] == 'p' || name[0] == 'P') {
 		int p = atoi(name + 1);
 		if (p >= 1 && p <= 7) return p;
 	}
-	return 5;
+	return 3;
 }
 
 // framerate is sample rate for audio streams
@@ -1612,14 +1612,50 @@ static void hookWriteMovieFrame() {
 	}
 }
 
+// The input system polls every controller slot every frame, and XInput
+// probes the hardware for empty slots each time (registry + device I/O).
+// A demo being rendered takes no input, so report "no controller" without
+// asking XInput while rendering.
+using XInputGetState_t = DWORD(WINAPI *)(DWORD index, void *state);
+static XInputGetState_t XInputGetState_Targets[3];
+static XInputGetState_t XInputGetState_Trampolines[3];
+
+template <int N>
+static DWORD WINAPI XInputGetState_Hook(DWORD index, void *state) {
+	if (g_render.isRendering.load()) return ERROR_DEVICE_NOT_CONNECTED;
+	return XInputGetState_Trampolines[N](index, state);
+}
+
+static void hookXInput() {
+	static const char *dlls[3] = {"XInput1_3.dll", "xinput1_4.dll", "XInput9_1_0.dll"};
+	static void *hooks[3] = {(void *)&XInputGetState_Hook<0>, (void *)&XInputGetState_Hook<1>, (void *)&XInputGetState_Hook<2>};
+	MH_Initialize();
+	for (int i = 0; i < 3; ++i) {
+		HMODULE mod = GetModuleHandleA(dlls[i]);
+		auto fn = mod ? (XInputGetState_t)GetProcAddress(mod, "XInputGetState") : nullptr;
+		if (!fn) continue;
+		if (MH_CreateHook((LPVOID)fn, hooks[i], (LPVOID *)&XInputGetState_Trampolines[i]) == MH_OK && MH_EnableHook((LPVOID)fn) == MH_OK) {
+			XInputGetState_Targets[i] = fn;
+		}
+	}
+}
+
 static void unhookWriteMovieFrame() {
 	if (WriteMovieFrame_Target) {
 		MH_DisableHook((LPVOID)WriteMovieFrame_Target);
 		MH_RemoveHook((LPVOID)WriteMovieFrame_Target);
 		WriteMovieFrame_Target = nullptr;
 	}
+	for (auto &fn : XInputGetState_Targets) {
+		if (fn) {
+			MH_DisableHook((LPVOID)fn);
+			MH_RemoveHook((LPVOID)fn);
+			fn = nullptr;
+		}
+	}
 }
 #else
+static void hookXInput() {}
 static void hookWriteMovieFrame() {}
 static void unhookWriteMovieFrame() {}
 #endif
@@ -1759,6 +1795,7 @@ void Renderer::Init(void **videomode) {
 	Command::Hook("endmovie", &endmovie_cbk, endmovie_origCbk);
 
 	hookWriteMovieFrame();
+	hookXInput();
 }
 
 void Renderer::Cleanup() {
