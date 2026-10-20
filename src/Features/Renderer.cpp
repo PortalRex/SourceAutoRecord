@@ -325,6 +325,7 @@ static struct
 	std::atomic<bool> sessionActive;
 	std::atomic<bool> failed;
 	std::atomic<bool> stopError;
+	std::atomic<bool> outputClosed;  // the encoder thread has finished the file
 	bool useGpu;
 
 	int fps;
@@ -343,6 +344,7 @@ static struct
 	bool headerWritten;
 	std::vector<AVFrame *> pendingAudio;  // encoder thread only
 	std::string encoderName;
+	std::string deferredQuit;  // main thread
 
 	// Audio: the encoder needs frame_size samples per frame, so we collect
 	// samples from the game until we have a full frame
@@ -449,7 +451,18 @@ void RendererCore::SubmitVideoPacket(AVPacket *pkt) {
 	g_render.encQueue.Push({EncItem::PACKET, nullptr, pkt});
 }
 
+static void stopRender(bool error);
+
 ON_EVENT(SAR_UNLOAD) {
+	// Quitting mid-render: stop capturing and give the encoder a few
+	// seconds to write the rest of the file (the GPU path also needs the
+	// render thread to run its final flush, which may not happen any more)
+	if (g_render.isRendering.load()) stopRender(false);
+	if (g_render.sessionActive.load()) {
+		for (int i = 0; i < 500 && !g_render.outputClosed.load(); ++i) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+	}
 	if (g_render.encoder.joinable()) g_render.encoder.detach();
 	if (g_render.converter.joinable()) g_render.converter.detach();
 	RendererGpu::Shutdown();
@@ -1033,6 +1046,7 @@ static void finishOutput() {
 	}
 	closeOutput(true);
 	if (!wroteFile) remove(g_render.filename.c_str());
+	g_render.outputClosed.store(true);
 
 	int frames = g_render.framesCaptured.load();
 	int64_t wall = RendererCore::NowMicros() - g_render.startTime;
@@ -1061,6 +1075,12 @@ static void finishOutput() {
 		g_render.sessionActive.store(false);
 		(void)error;
 		Event::Trigger<Event::RENDERER_FINISH>({});
+
+		if (!g_render.deferredQuit.empty()) {
+			std::string cmd = g_render.deferredQuit;
+			g_render.deferredQuit.clear();
+			engine->ExecuteCommand(cmd.c_str());
+		}
 	});
 }
 
@@ -1437,6 +1457,7 @@ static void startRender() {
 	g_render.startTime = RendererCore::NowMicros();
 
 	g_render.encoderName = g_render.nvenc ? (videoCodec->id == AV_CODEC_ID_HEVC ? "hevc_nvenc (zero-copy)" : "h264_nvenc (zero-copy)") : g_render.videoStream.codec->name;
+	g_render.outputClosed.store(false);
 	g_render.sessionActive.store(true);
 	g_render.encoder = std::thread(encoderThread);
 	if (!g_render.useGpu) g_render.converter = std::thread(converterThread);
@@ -1539,6 +1560,66 @@ static void SND_RecordBuffer_Hook() {
 		}
 	}
 }
+
+// }}}
+
+// Engine movie frame {{{
+
+// While a movie is "recording" (we set g_movieInfo so the engine mixes
+// audio into SND_RecordBuffer), the engine calls
+// IVideoMode::WriteMovieFrame at the end of every frame. That function
+// allocates a w*h*3 buffer and does a full synchronous ReadScreenPixels
+// before it checks which outputs are enabled - with our type of 0 it then
+// throws the pixels away. That is a hidden GPU stall + CPU conversion per
+// frame, so skip it entirely while SAR renders.
+
+#ifdef _WIN32
+using WriteMovieFrame_t = void(__thiscall *)(void *thisptr, void *info);
+static WriteMovieFrame_t WriteMovieFrame_Target;
+static WriteMovieFrame_t WriteMovieFrame_Trampoline;
+
+static void __fastcall WriteMovieFrame_Hook(void *thisptr, int edx, void *info) {
+	if (g_render.isRendering.load()) return;
+	WriteMovieFrame_Trampoline(thisptr, info);
+}
+
+// Sanity check before hooking: the function warns about a missing movie
+// name ("Tried to write movie buffer with no filename set!")
+static bool looksLikeWriteMovieFrame(const uint8_t *fn) {
+	for (int i = 0; i < 0x60; ++i) {
+		if (fn[i] != 0x68) continue;  // push imm32
+		const char *str = *(const char *const *)(fn + i + 1);
+		MEMORY_BASIC_INFORMATION mbi;
+		if (!VirtualQuery(str, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) continue;
+		if (!strncmp(str, "Tried to write movie buffer", 27)) return true;
+	}
+	return false;
+}
+
+static void hookWriteMovieFrame() {
+	if (!*g_videomode) return;
+	auto fn = Memory::VMT<WriteMovieFrame_t>(*g_videomode, Offsets::WriteMovieFrame);
+	if (!fn || !looksLikeWriteMovieFrame((const uint8_t *)fn)) {
+		console->Print("Renderer: IVideoMode::WriteMovieFrame not recognized; renders keep the engine's extra read-back\n");
+		return;
+	}
+	MH_Initialize();
+	if (MH_CreateHook((LPVOID)fn, (LPVOID)&WriteMovieFrame_Hook, (LPVOID *)&WriteMovieFrame_Trampoline) == MH_OK && MH_EnableHook((LPVOID)fn) == MH_OK) {
+		WriteMovieFrame_Target = fn;
+	}
+}
+
+static void unhookWriteMovieFrame() {
+	if (WriteMovieFrame_Target) {
+		MH_DisableHook((LPVOID)WriteMovieFrame_Target);
+		MH_RemoveHook((LPVOID)WriteMovieFrame_Target);
+		WriteMovieFrame_Target = nullptr;
+	}
+}
+#else
+static void hookWriteMovieFrame() {}
+static void unhookWriteMovieFrame() {}
+#endif
 
 // }}}
 
@@ -1673,12 +1754,23 @@ void Renderer::Init(void **videomode) {
 
 	Command::Hook("startmovie", &startmovie_cbk, startmovie_origCbk);
 	Command::Hook("endmovie", &endmovie_cbk, endmovie_origCbk);
+
+	hookWriteMovieFrame();
 }
 
 void Renderer::Cleanup() {
+	unhookWriteMovieFrame();
 	g_RecordBufferHook.Disable();
 	Command::Unhook("startmovie", startmovie_origCbk);
 	Command::Unhook("endmovie", endmovie_origCbk);
+}
+
+bool Renderer::DeferQuit(const char *cmd) {
+	if (!g_render.sessionActive.load()) return false;
+	if (g_render.isRendering.load()) stopRender(false);
+	console->Print("Finishing the render before running '%s'...\n", cmd);
+	g_render.deferredQuit = cmd;
+	return true;
 }
 
 bool Renderer::IsRunning() {

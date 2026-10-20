@@ -536,9 +536,11 @@ DETOUR_COMMAND(Engine::plugin_unload) {
 	}
 }
 DETOUR_COMMAND(Engine::exit) {
+	if (Renderer::DeferQuit("exit")) return;
 	engine->SafeUnload("exit");
 }
 DETOUR_COMMAND(Engine::quit) {
+	if (Renderer::DeferQuit("quit")) return;
 	engine->SafeUnload("quit");
 }
 DETOUR_COMMAND(Engine::restart) {

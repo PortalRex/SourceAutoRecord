@@ -283,6 +283,7 @@ OFFSET_DEFAULT(Sleep, 25, 26)
 OFFSET_DEFAULT(GetModeWidth, 14, 15)
 OFFSET_DEFAULT(GetModeHeight, 15, 16)
 OFFSET_DEFAULT(ReadScreenPixels, 28, 29)
+OFFSET_DEFAULT(WriteMovieFrame, 23, 24)
 
 // IFileSystem
 OFFSET_DEFAULT(GetSearchPath, 16, 16)
