@@ -1670,118 +1670,149 @@ static void unhookWriteMovieFrame() {
 		}
 	}
 }
-// Virtual wall clock {{{
+// HUD clock {{{
 
-// Renders run many times faster than real time, but parts of the game run
-// on wall-clock time (gpGlobals->realtime, VGUI animations, the challenge
-// mode timer HUD's refresh), so in the video they would only update every
-// few frames. While rendering, the main thread's Plat_FloatTime/Plat_MSTime
-// return a clock that advances exactly one game frame per engine frame,
-// i.e. as if the demo were played back in real time. Other threads keep
-// real time so nothing can wait forever on it.
+// Renders run many times faster than real time, but the client's HUD reads
+// the wall clock (Plat_FloatTime) directly: the challenge mode timer only
+// refreshes every so many real milliseconds, so in a fast render it held
+// the same value for several frames. While rendering, the main thread's
+// Plat_FloatTime/Plat_MSTime *as imported by the client and VGUI DLLs*
+// advance exactly one frame per engine frame, as in real-time playback.
+// The engine keeps real time (its frame loop must never see time go
+// backwards), and after the render the client's clock eases back to real
+// time without ever going backwards.
 
 using PlatFloatTime_t = double (*)();
 using PlatMSTime_t = unsigned long (*)();
-static PlatFloatTime_t PlatFloatTime_Target, PlatFloatTime_Real;
-static PlatMSTime_t PlatMSTime_Target, PlatMSTime_Real;
+static PlatFloatTime_t g_realFloatTime;
+static PlatMSTime_t g_realMSTime;
 static DWORD g_mainThreadId;
-static std::atomic<bool> g_virtualClock{false};
-static double g_virtualNow;      // main thread
-static double g_virtualStep;     // seconds per engine frame
-static double g_clockOffset;     // added to real time outside renders, keeps time monotonic
-static double g_lastReturned;    // main thread
-static unsigned g_callsThisFrame;
+static std::atomic<bool> g_hudClockOn{false};
+static double g_hudNow;       // main thread, virtual time this frame
+static double g_hudStep;
+static double g_hudLast;      // main thread, last value handed out
+static double g_hudMsOffset;  // Plat_MSTime - Plat_FloatTime * 1000 (their epochs differ)
+static unsigned g_hudCalls;
 
-static double virtualFloatTime() {
-	if (GetCurrentThreadId() != g_mainThreadId) return PlatFloatTime_Real() + g_clockOffset;
+struct IatPatch {
+	void **slot;
+	void *original;
+};
+static std::vector<IatPatch> g_iatPatches;
+
+static double hudFloatTime() {
+	double real = g_realFloatTime();
+	if (GetCurrentThreadId() != g_mainThreadId) return real;
 	double t;
-	if (g_virtualClock.load()) {
-		// Strictly increasing within a frame, but never past the next frame
-		t = g_virtualNow + std::min(++g_callsThisFrame * 1e-7, g_virtualStep * 0.5);
+	if (g_hudClockOn.load()) {
+		// strictly increasing within a frame, never reaching the next frame
+		t = g_hudNow + std::min(++g_hudCalls * 1e-7, g_hudStep * 0.5);
+	} else if (g_hudLast > real) {
+		// After a render the virtual clock is ahead; let it advance at half
+		// speed until real time catches up instead of jumping back
+		static double lastReal = real;
+		t = g_hudLast + std::max(0.0, real - lastReal) * 0.5;
+		lastReal = real;
 	} else {
-		t = PlatFloatTime_Real() + g_clockOffset;
+		t = real;
 	}
-	if (t < g_lastReturned) t = g_lastReturned;
-	g_lastReturned = t;
+	if (t < g_hudLast) t = g_hudLast;
+	g_hudLast = t;
 	return t;
 }
 
-static double PlatFloatTime_Hook() {
-	return virtualFloatTime();
+static double HudPlatFloatTime() {
+	return hudFloatTime();
 }
 
-static unsigned long PlatMSTime_Hook() {
-	if (GetCurrentThreadId() != g_mainThreadId) return PlatMSTime_Real();
-	return (unsigned long)(virtualFloatTime() * 1000.0);
+static unsigned long HudPlatMSTime() {
+	if (GetCurrentThreadId() != g_mainThreadId) return g_realMSTime();
+	return (unsigned long)(hudFloatTime() * 1000.0 + g_hudMsOffset);
 }
 
-static void hookClock() {
-	if (PlatFloatTime_Target) return;
+// Points a module's import of tier0!name at `fn`
+static void patchImport(HMODULE mod, const char *name, void *fn) {
+	auto base = (uint8_t *)mod;
+	auto nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)mod)->e_lfanew);
+	auto &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	if (!dir.VirtualAddress) return;
+	for (auto imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress); imp->Name; ++imp) {
+		if (_stricmp((const char *)(base + imp->Name), "tier0.dll")) continue;
+		if (!imp->OriginalFirstThunk) continue;
+		auto names = (IMAGE_THUNK_DATA *)(base + imp->OriginalFirstThunk);
+		auto slots = (IMAGE_THUNK_DATA *)(base + imp->FirstThunk);
+		for (; names->u1.AddressOfData; ++names, ++slots) {
+			if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+			auto ibn = (IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData);
+			if (strcmp((const char *)ibn->Name, name)) continue;
+			void **slot = (void **)&slots->u1.Function;
+			DWORD old;
+			if (!VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old)) return;
+			g_iatPatches.push_back({slot, *slot});
+			*slot = fn;
+			VirtualProtect(slot, sizeof(void *), old, &old);
+			return;
+		}
+	}
+}
+
+static void hookHudClock() {
+	if (!g_iatPatches.empty() || !g_mainThreadId) return;
 	HMODULE tier0 = GetModuleHandleA("tier0.dll");
-	auto ft = tier0 ? (PlatFloatTime_t)GetProcAddress(tier0, "Plat_FloatTime") : nullptr;
-	auto ms = tier0 ? (PlatMSTime_t)GetProcAddress(tier0, "Plat_MSTime") : nullptr;
-	if (!ft || !ms) return;
-	MH_Initialize();
-	if (MH_CreateHook((LPVOID)ft, (LPVOID)&PlatFloatTime_Hook, (LPVOID *)&PlatFloatTime_Real) != MH_OK) return;
-	if (MH_CreateHook((LPVOID)ms, (LPVOID)&PlatMSTime_Hook, (LPVOID *)&PlatMSTime_Real) != MH_OK) {
-		MH_RemoveHook((LPVOID)ft);
-		return;
+	g_realFloatTime = tier0 ? (PlatFloatTime_t)GetProcAddress(tier0, "Plat_FloatTime") : nullptr;
+	g_realMSTime = tier0 ? (PlatMSTime_t)GetProcAddress(tier0, "Plat_MSTime") : nullptr;
+	if (!g_realFloatTime || !g_realMSTime) return;
+	g_hudMsOffset = (double)g_realMSTime() - g_realFloatTime() * 1000.0;
+	for (const char *dll : {"client.dll", "vgui2.dll", "vguimatsurface.dll"}) {
+		HMODULE mod = GetModuleHandleA(dll);
+		if (!mod) continue;
+		patchImport(mod, "Plat_FloatTime", (void *)&HudPlatFloatTime);
+		patchImport(mod, "Plat_MSTime", (void *)&HudPlatMSTime);
 	}
-	MH_EnableHook((LPVOID)ft);
-	MH_EnableHook((LPVOID)ms);
-	PlatFloatTime_Target = ft;
-	PlatMSTime_Target = ms;
 }
 
-static void unhookClock() {
-	g_virtualClock.store(false);
-	if (PlatFloatTime_Target) {
-		MH_DisableHook((LPVOID)PlatFloatTime_Target);
-		MH_RemoveHook((LPVOID)PlatFloatTime_Target);
-		PlatFloatTime_Target = nullptr;
+static void unhookHudClock() {
+	g_hudClockOn.store(false);
+	for (auto &p : g_iatPatches) {
+		DWORD old;
+		if (VirtualProtect(p.slot, sizeof(void *), PAGE_READWRITE, &old)) {
+			*p.slot = p.original;
+			VirtualProtect(p.slot, sizeof(void *), old, &old);
+		}
 	}
-	if (PlatMSTime_Target) {
-		MH_DisableHook((LPVOID)PlatMSTime_Target);
-		MH_RemoveHook((LPVOID)PlatMSTime_Target);
-		PlatMSTime_Target = nullptr;
-	}
+	g_iatPatches.clear();
 }
 
 // Main thread
 static void startVirtualClock(int framesPerSecond) {
-	if (!sar_render_virtual_clock.GetBool()) return;
-	hookClock();
-	if (!PlatFloatTime_Target || framesPerSecond <= 0) return;
-	g_virtualStep = 1.0 / framesPerSecond;
-	g_virtualNow = std::max(PlatFloatTime_Real() + g_clockOffset, g_lastReturned);
-	g_callsThisFrame = 0;
-	g_virtualClock.store(true);
+	if (!sar_render_virtual_clock.GetBool() || framesPerSecond <= 0) return;
+	hookHudClock();
+	if (g_iatPatches.empty()) return;
+	g_hudStep = 1.0 / framesPerSecond;
+	g_hudNow = std::max(g_realFloatTime(), g_hudLast);
+	g_hudCalls = 0;
+	g_hudClockOn.store(true);
 }
 
 static void advanceVirtualClock() {
-	if (!g_virtualClock.load()) return;
-	g_virtualNow += g_virtualStep;
-	g_callsThisFrame = 0;
+	if (!g_hudClockOn.load()) return;
+	g_hudNow += g_hudStep;
+	g_hudCalls = 0;
 }
 
 static void stopVirtualClock() {
-	if (!g_virtualClock.load()) return;
-	g_virtualClock.store(false);
-	// Renders slower than real time leave the virtual clock ahead; never let
-	// time go backwards when switching back
-	double real = PlatFloatTime_Real();
-	if (g_lastReturned > real + g_clockOffset) g_clockOffset = g_lastReturned - real;
+	g_hudClockOn.store(false);
 }
 
 // }}}
 #else
 static void hookXInput() {}
-static void hookWriteMovieFrame() {}
-static void unhookWriteMovieFrame() {}
 static void startVirtualClock(int) {}
 static void advanceVirtualClock() {}
 static void stopVirtualClock() {}
-static void unhookClock() {}
+static void unhookHudClock() {}
+static void hookWriteMovieFrame() {}
+static void unhookWriteMovieFrame() {}
 #endif
 
 // }}}
@@ -1936,7 +1967,7 @@ void Renderer::Init(void **videomode) {
 }
 
 void Renderer::Cleanup() {
-	unhookClock();
+	unhookHudClock();
 	unhookWriteMovieFrame();
 	g_RecordBufferHook.Disable();
 	Command::Unhook("startmovie", startmovie_origCbk);
