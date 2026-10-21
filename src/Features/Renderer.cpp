@@ -347,7 +347,14 @@ static struct
 	std::vector<AVFrame *> pendingAudio;  // encoder thread only
 	std::string encoderName;
 	std::string deferredQuit;  // main thread
-	float savedFpsMax;         // restored when the render stops
+	float savedFpsMax;         // restored after the post-render hold
+	// Main thread. After a render, frames stay uncapped and unpresented for a
+	// moment: what runs next is usually a short wait before quitting
+	// (autorender: "wait 300;exit"), which otherwise ran at fps_max.
+	// holdFrames is -1 until the file is written, then counts down.
+	bool holding;
+	int holdFrames;
+	int64_t holdUntil;
 
 	// Audio: the encoder needs frame_size samples per frame, so we collect
 	// samples from the game until we have a full frame
@@ -1077,6 +1084,10 @@ static void finishOutput() {
 
 		g_render.sessionActive.store(false);
 		(void)error;
+		if (g_render.holding) {
+			g_render.holdFrames = 400;
+			g_render.holdUntil = RendererCore::NowMicros() + 1000000;
+		}
 		Event::Trigger<Event::RENDERER_FINISH>({});
 
 		if (!g_render.deferredQuit.empty()) {
@@ -1092,6 +1103,14 @@ static void advanceVirtualClock();
 static void stopVirtualClock();
 
 // Main thread
+static void releaseHold() {
+	if (!g_render.holding) return;
+	g_render.holding = false;
+	RendererGpu::SetSkipPresent(false);
+	fps_max.SetValue(g_render.savedFpsMax);
+}
+
+// Main thread
 static void stopRender(bool error) {
 	if (!g_render.isRendering.load()) return;
 
@@ -1102,8 +1121,8 @@ static void stopRender(bool error) {
 	}
 
 	g_render.stopError.store(error);
-	RendererGpu::SetSkipPresent(false);
-	fps_max.SetValue(g_render.savedFpsMax);
+	g_render.holding = true;
+	g_render.holdFrames = -1;
 	stopVirtualClock();
 	{
 		// Wait for an audio push in flight; no more audio after this
@@ -1481,7 +1500,9 @@ static void startRender() {
 	// fps_max allows, but CEngine::Frame (and so our capture) still runs.
 	// Faster than fps_max that would capture the same frame many times
 	// over, so the cap is lifted while rendering.
-	g_render.savedFpsMax = fps_max.GetFloat();
+	// a hold from the previous render already has the user's value saved
+	if (!g_render.holding) g_render.savedFpsMax = fps_max.GetFloat();
+	g_render.holding = false;
 	fps_max.SetValue(0);
 	startVirtualClock(host_framerate.GetInt());
 
@@ -1833,6 +1854,10 @@ static void captureCpu(bool accumulate, bool emit, int subframe) {
 }
 
 void Renderer::Frame() {
+	if (g_render.holding && g_render.holdFrames >= 0 && (g_render.holdFrames-- == 0 || RendererCore::NowMicros() > g_render.holdUntil)) {
+		releaseHold();
+	}
+
 	if (Renderer::isDemoLoading && sar_render_autostart.GetBool()) {
 		bool start = engine->demoplayer->IsPlaybackFixReady();
 		start &= session->isRunning;
@@ -1967,6 +1992,7 @@ void Renderer::Init(void **videomode) {
 }
 
 void Renderer::Cleanup() {
+	releaseHold();
 	unhookHudClock();
 	unhookWriteMovieFrame();
 	g_RecordBufferHook.Disable();
