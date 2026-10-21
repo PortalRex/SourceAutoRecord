@@ -1,5 +1,7 @@
 #include "Event.hpp"
 #include "Modules/Console.hpp"
+#include "Modules/Engine.hpp"
+#include "Modules/EngineDemoPlayer.hpp"
 #include "Modules/Server.hpp"
 #include "Offsets.hpp"
 #include "Utils.hpp"
@@ -81,4 +83,31 @@ ON_EVENT(DEMO_STOP) {
 	if (sar_demo_modelcache_clear_protected_flags.GetBool() && sv_cheats.GetBool()) {
 		ClearProtectedModelFlags();
 	}
+}
+
+// A demo that changes map during playback (several demos merged into one) never
+// stops between maps, so DEMO_STOP never runs and every map's models pile up in
+// the 256MB model cache until the game crashes. There is no vanilla behaviour to
+// keep here (it always crashes), so this doesn't need the cvar.
+// Only clear once the playback fix has finished and the map really changed: a
+// reload of the same map (the playback fix restart, a save load) purges models
+// that are still in use if their flags were cleared.
+static bool g_demoStarted = false;
+static std::string g_demoMap;
+
+ON_EVENT(DEMO_START) {
+	g_demoStarted = true;
+	g_demoMap = engine->GetCurrentMapName();
+}
+
+ON_EVENT(DEMO_STOP) {
+	g_demoStarted = false;
+}
+
+ON_EVENT(SESSION_START) {
+	if (!g_demoStarted || !engine->demoplayer->IsPlaying()) return;
+	auto map = engine->GetCurrentMapName();
+	if (map == g_demoMap) return;
+	g_demoMap = map;
+	ClearProtectedModelFlags();
 }
