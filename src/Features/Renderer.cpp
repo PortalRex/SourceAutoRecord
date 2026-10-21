@@ -86,6 +86,7 @@ static Variable sar_render_nvenc_bframes("sar_render_nvenc_bframes", "0", 0, 4, 
 static Variable sar_render_nvenc_multipass("sar_render_nvenc_multipass", "-1", -1, 2, "NVENC multi-pass: -1 = preset default, 0 = off, 1 = quarter resolution, 2 = full resolution\n");
 static Variable sar_render_display("sar_render_display", "0", 0, 1, "Show the frames in the game window while rendering. Off is much faster: the game window freezes until the render finishes.\n");
 static Variable sar_render_stats("sar_render_stats", "1", 0, 1, "Print timing statistics when a render finishes\n");
+static Variable sar_render_virtual_clock("sar_render_virtual_clock", "1", 0, 1, "While rendering, make the game's wall clock advance one frame per rendered frame, so HUD elements timed on real time (the challenge mode timer) update as in real-time playback\n");
 
 // g_videomode VMT wrappers {{{
 
@@ -1748,6 +1749,7 @@ static void unhookClock() {
 
 // Main thread
 static void startVirtualClock(int framesPerSecond) {
+	if (!sar_render_virtual_clock.GetBool()) return;
 	hookClock();
 	if (!PlatFloatTime_Target || framesPerSecond <= 0) return;
 	g_virtualStep = 1.0 / framesPerSecond;
