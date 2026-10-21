@@ -656,6 +656,7 @@ namespace {
 		uint64_t nextPts;
 		int64_t outIndex;
 		int64_t bytes;
+		int remaps;               // input surfaces registered again after a failed map
 	} g_nv;
 
 	bool nvLoad(const char **why) {
@@ -708,6 +709,19 @@ namespace {
 		if (g_nv.enc) fn.nvEncDestroyEncoder(g_nv.enc);
 		g_nv.enc = nullptr;
 		g_nv.head = g_nv.count = g_nv.encoding = 0;
+	}
+
+	NVENCSTATUS nvRegister(NvSlot &sl) {
+		NV_ENC_REGISTER_RESOURCE rr = {NV_ENC_REGISTER_RESOURCE_VER};
+		rr.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
+		rr.resourceToRegister = sl.rt;
+		rr.width = g_gpu.p.width;
+		rr.height = g_gpu.p.height;
+		rr.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
+		rr.bufferUsage = NV_ENC_INPUT_IMAGE;
+		NVENCSTATUS st = g_nv.fn.nvEncRegisterResource(g_nv.enc, &rr);
+		sl.reg = st == NV_ENC_SUCCESS ? rr.registeredResource : nullptr;
+		return st;
 	}
 
 	bool nvOpen(IDirect3DDevice9 *dev) {
@@ -819,16 +833,8 @@ namespace {
 			if (FAILED(hr)) return fail("NVENC input surface", hr), false;
 			hr = dev->CreateQuery(D3DQUERYTYPE_EVENT, &sl.query);
 			if (FAILED(hr)) return fail("CreateQuery", hr), false;
-			NV_ENC_REGISTER_RESOURCE rr = {NV_ENC_REGISTER_RESOURCE_VER};
-			rr.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
-			rr.resourceToRegister = sl.rt;
-			rr.width = p.width;
-			rr.height = p.height;
-			rr.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
-			rr.bufferUsage = NV_ENC_INPUT_IMAGE;
-			st = fn.nvEncRegisterResource(g_nv.enc, &rr);
+			st = nvRegister(sl);
 			if (st != NV_ENC_SUCCESS) return nvFail("registering an input surface", st), false;
-			sl.reg = rr.registeredResource;
 			NV_ENC_CREATE_BITSTREAM_BUFFER cb = {NV_ENC_CREATE_BITSTREAM_BUFFER_VER};
 			st = fn.nvEncCreateBitstreamBuffer(g_nv.enc, &cb);
 			if (st != NV_ENC_SUCCESS) return nvFail("creating a bitstream buffer", st), false;
@@ -839,6 +845,7 @@ namespace {
 		g_nv.nextPts = 0;
 		g_nv.outIndex = 0;
 		g_nv.bytes = 0;
+		g_nv.remaps = 0;
 
 		// SPS/PPS (+VPS) for the container header
 		uint8_t hdr[1024];
@@ -853,11 +860,31 @@ namespace {
 		return true;
 	}
 
+	// Mapping a registered surface can fail now and then (seen once in a
+	// full-game render: INVALID_PARAM right after a map load). One failure
+	// used to end the whole render; registering the surface again recovers.
+	NVENCSTATUS nvMap(NvSlot &sl, NV_ENC_MAP_INPUT_RESOURCE &mp) {
+		auto &fn = g_nv.fn;
+		NVENCSTATUS st = NV_ENC_ERR_INVALID_PARAM;
+		for (int attempt = 0; attempt < 3; ++attempt) {
+			if (attempt > 0) {
+				Sleep(attempt);
+				if (sl.reg) fn.nvEncUnregisterResource(g_nv.enc, sl.reg);
+				if (nvRegister(sl) != NV_ENC_SUCCESS) continue;
+				++g_nv.remaps;
+			}
+			mp = {NV_ENC_MAP_INPUT_RESOURCE_VER};
+			mp.registeredResource = sl.reg;
+			st = fn.nvEncMapInputResource(g_nv.enc, &mp);
+			if (st == NV_ENC_SUCCESS) break;
+		}
+		return st;
+	}
+
 	void nvSubmit(NvSlot &sl) {
 		auto &fn = g_nv.fn;
-		NV_ENC_MAP_INPUT_RESOURCE mp = {NV_ENC_MAP_INPUT_RESOURCE_VER};
-		mp.registeredResource = sl.reg;
-		NVENCSTATUS st = fn.nvEncMapInputResource(g_nv.enc, &mp);
+		NV_ENC_MAP_INPUT_RESOURCE mp;
+		NVENCSTATUS st = nvMap(sl, mp);
 		if (st != NV_ENC_SUCCESS) return nvFail("mapping an input surface", st);
 		sl.mapped = mp.mappedResource;
 
@@ -1058,6 +1085,7 @@ namespace {
 		}
 		bool wasNvenc = g_gpu.p.nvenc.enabled;
 		int64_t nvBytes = g_nv.bytes;
+		int nvRemaps = g_nv.remaps;
 		nvDestroy();
 		int emitted = g_gpu.emitted;
 		int64_t runUs = g_gpu.runUs, waitUs = g_gpu.waitUs;
@@ -1067,6 +1095,7 @@ namespace {
 		RendererCore::SubmitEnd();
 		if (wasNvenc) {
 			THREAD_PRINT("[render] NVENC: %d frames, %.1f MB, render-thread work %.0fms (of which waiting for the GPU %.0fms)\n", emitted, nvBytes / 1048576.0, runUs / 1000.0, waitUs / 1000.0);
+			if (nvRemaps) THREAD_PRINT("[render] NVENC: recovered %d failed input-surface maps\n", nvRemaps);
 		} else {
 			THREAD_PRINT("[render] GPU path: %d frames read back, render-thread work %.0fms (of which waiting for the GPU %.0fms)\n", emitted, runUs / 1000.0, waitUs / 1000.0);
 		}
