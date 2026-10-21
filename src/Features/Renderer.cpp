@@ -346,6 +346,7 @@ static struct
 	std::vector<AVFrame *> pendingAudio;  // encoder thread only
 	std::string encoderName;
 	std::string deferredQuit;  // main thread
+	float savedFpsMax;         // restored when the render stops
 
 	// Audio: the encoder needs frame_size samples per frame, so we collect
 	// samples from the game until we have a full frame
@@ -1097,6 +1098,7 @@ static void stopRender(bool error) {
 
 	g_render.stopError.store(error);
 	RendererGpu::SetSkipPresent(false);
+	fps_max.SetValue(g_render.savedFpsMax);
 	{
 		// Wait for an audio push in flight; no more audio after this
 		std::lock_guard<std::mutex> lock(g_render.audioLock);
@@ -1469,6 +1471,13 @@ static void startRender() {
 	g_movieInfo->movieframe = 0;
 	g_movieInfo->type = 0;  // Should stop anything actually being output
 
+	// The engine skips simulating a frame when it comes sooner than
+	// fps_max allows, but CEngine::Frame (and so our capture) still runs.
+	// Faster than fps_max that would capture the same frame many times
+	// over, so the cap is lifted while rendering.
+	g_render.savedFpsMax = fps_max.GetFloat();
+	fps_max.SetValue(0);
+
 	g_render.isRendering.store(true);
 	if (g_render.useGpu && !sar_render_display.GetBool()) RendererGpu::SetSkipPresent(true);
 
@@ -1704,6 +1713,13 @@ void Renderer::Frame() {
 	}
 
 	if (!g_render.isRendering.load()) return;
+
+	// Something (configs, sar_loads_uncap restoring after a load) put the
+	// cap back; frames this call may not have been simulated, so skip it
+	if (fps_max.GetFloat() != 0) {
+		fps_max.SetValue(0);
+		return;
+	}
 
 	if (g_render.failed.load() || (g_render.useGpu && RendererGpu::Failed())) {
 		std::string err;
