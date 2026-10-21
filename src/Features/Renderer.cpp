@@ -1086,6 +1086,10 @@ static void finishOutput() {
 	});
 }
 
+static void startVirtualClock(int framesPerSecond);
+static void advanceVirtualClock();
+static void stopVirtualClock();
+
 // Main thread
 static void stopRender(bool error) {
 	if (!g_render.isRendering.load()) return;
@@ -1099,6 +1103,7 @@ static void stopRender(bool error) {
 	g_render.stopError.store(error);
 	RendererGpu::SetSkipPresent(false);
 	fps_max.SetValue(g_render.savedFpsMax);
+	stopVirtualClock();
 	{
 		// Wait for an audio push in flight; no more audio after this
 		std::lock_guard<std::mutex> lock(g_render.audioLock);
@@ -1477,6 +1482,7 @@ static void startRender() {
 	// over, so the cap is lifted while rendering.
 	g_render.savedFpsMax = fps_max.GetFloat();
 	fps_max.SetValue(0);
+	startVirtualClock(host_framerate.GetInt());
 
 	g_render.isRendering.store(true);
 	if (g_render.useGpu && !sar_render_display.GetBool()) RendererGpu::SetSkipPresent(true);
@@ -1663,10 +1669,117 @@ static void unhookWriteMovieFrame() {
 		}
 	}
 }
+// Virtual wall clock {{{
+
+// Renders run many times faster than real time, but parts of the game run
+// on wall-clock time (gpGlobals->realtime, VGUI animations, the challenge
+// mode timer HUD's refresh), so in the video they would only update every
+// few frames. While rendering, the main thread's Plat_FloatTime/Plat_MSTime
+// return a clock that advances exactly one game frame per engine frame,
+// i.e. as if the demo were played back in real time. Other threads keep
+// real time so nothing can wait forever on it.
+
+using PlatFloatTime_t = double (*)();
+using PlatMSTime_t = unsigned long (*)();
+static PlatFloatTime_t PlatFloatTime_Target, PlatFloatTime_Real;
+static PlatMSTime_t PlatMSTime_Target, PlatMSTime_Real;
+static DWORD g_mainThreadId;
+static std::atomic<bool> g_virtualClock{false};
+static double g_virtualNow;      // main thread
+static double g_virtualStep;     // seconds per engine frame
+static double g_clockOffset;     // added to real time outside renders, keeps time monotonic
+static double g_lastReturned;    // main thread
+static unsigned g_callsThisFrame;
+
+static double virtualFloatTime() {
+	if (GetCurrentThreadId() != g_mainThreadId) return PlatFloatTime_Real() + g_clockOffset;
+	double t;
+	if (g_virtualClock.load()) {
+		// Strictly increasing within a frame, but never past the next frame
+		t = g_virtualNow + std::min(++g_callsThisFrame * 1e-7, g_virtualStep * 0.5);
+	} else {
+		t = PlatFloatTime_Real() + g_clockOffset;
+	}
+	if (t < g_lastReturned) t = g_lastReturned;
+	g_lastReturned = t;
+	return t;
+}
+
+static double PlatFloatTime_Hook() {
+	return virtualFloatTime();
+}
+
+static unsigned long PlatMSTime_Hook() {
+	if (GetCurrentThreadId() != g_mainThreadId) return PlatMSTime_Real();
+	return (unsigned long)(virtualFloatTime() * 1000.0);
+}
+
+static void hookClock() {
+	if (PlatFloatTime_Target) return;
+	HMODULE tier0 = GetModuleHandleA("tier0.dll");
+	auto ft = tier0 ? (PlatFloatTime_t)GetProcAddress(tier0, "Plat_FloatTime") : nullptr;
+	auto ms = tier0 ? (PlatMSTime_t)GetProcAddress(tier0, "Plat_MSTime") : nullptr;
+	if (!ft || !ms) return;
+	MH_Initialize();
+	if (MH_CreateHook((LPVOID)ft, (LPVOID)&PlatFloatTime_Hook, (LPVOID *)&PlatFloatTime_Real) != MH_OK) return;
+	if (MH_CreateHook((LPVOID)ms, (LPVOID)&PlatMSTime_Hook, (LPVOID *)&PlatMSTime_Real) != MH_OK) {
+		MH_RemoveHook((LPVOID)ft);
+		return;
+	}
+	MH_EnableHook((LPVOID)ft);
+	MH_EnableHook((LPVOID)ms);
+	PlatFloatTime_Target = ft;
+	PlatMSTime_Target = ms;
+}
+
+static void unhookClock() {
+	g_virtualClock.store(false);
+	if (PlatFloatTime_Target) {
+		MH_DisableHook((LPVOID)PlatFloatTime_Target);
+		MH_RemoveHook((LPVOID)PlatFloatTime_Target);
+		PlatFloatTime_Target = nullptr;
+	}
+	if (PlatMSTime_Target) {
+		MH_DisableHook((LPVOID)PlatMSTime_Target);
+		MH_RemoveHook((LPVOID)PlatMSTime_Target);
+		PlatMSTime_Target = nullptr;
+	}
+}
+
+// Main thread
+static void startVirtualClock(int framesPerSecond) {
+	hookClock();
+	if (!PlatFloatTime_Target || framesPerSecond <= 0) return;
+	g_virtualStep = 1.0 / framesPerSecond;
+	g_virtualNow = std::max(PlatFloatTime_Real() + g_clockOffset, g_lastReturned);
+	g_callsThisFrame = 0;
+	g_virtualClock.store(true);
+}
+
+static void advanceVirtualClock() {
+	if (!g_virtualClock.load()) return;
+	g_virtualNow += g_virtualStep;
+	g_callsThisFrame = 0;
+}
+
+static void stopVirtualClock() {
+	if (!g_virtualClock.load()) return;
+	g_virtualClock.store(false);
+	// Renders slower than real time leave the virtual clock ahead; never let
+	// time go backwards when switching back
+	double real = PlatFloatTime_Real();
+	if (g_lastReturned > real + g_clockOffset) g_clockOffset = g_lastReturned - real;
+}
+
+// }}}
 #else
 static void hookXInput() {}
 static void hookWriteMovieFrame() {}
 static void unhookWriteMovieFrame() {}
+static void startVirtualClock(int) {}
+static void advanceVirtualClock() {}
+static void stopVirtualClock() {}
+static void unhookClock() {}
 #endif
 
 // }}}
@@ -1720,6 +1833,9 @@ void Renderer::Frame() {
 		fps_max.SetValue(0);
 		return;
 	}
+
+	// One engine frame = one host_framerate step of wall-clock time
+	advanceVirtualClock();
 
 	if (g_render.failed.load() || (g_render.useGpu && RendererGpu::Failed())) {
 		std::string err;
@@ -1789,6 +1905,9 @@ ON_EVENT(DEMO_STOP) {
 
 void Renderer::Init(void **videomode) {
 	g_videomode = videomode;
+#ifdef _WIN32
+	g_mainThreadId = GetCurrentThreadId();
+#endif
 
 	snd_surround_speakers = Variable("snd_surround_speakers");
 
@@ -1815,6 +1934,7 @@ void Renderer::Init(void **videomode) {
 }
 
 void Renderer::Cleanup() {
+	unhookClock();
 	unhookWriteMovieFrame();
 	g_RecordBufferHook.Disable();
 	Command::Unhook("startmovie", startmovie_origCbk);
