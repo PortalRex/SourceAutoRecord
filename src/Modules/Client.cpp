@@ -899,9 +899,17 @@ DETOUR_T(void, Client::AddShadowToReceiver, unsigned short handle, void *pRender
 
 	g_AddShadowToReceiverHook.Disable();
 	Client::AddShadowToReceiver(thisptr, handle, pRenderable, type);
-	g_AddShadowToReceiverHook.Enable();
+	if (sar_disable_viewmodel_shadows.GetBool()) g_AddShadowToReceiverHook.Enable();
 }
 Hook g_AddShadowToReceiverHook(&Client::AddShadowToReceiver_Hook);
+
+// The engine calls AddShadowToReceiver constantly, and every call through
+// the hook rewrites the function's first bytes twice, so the hook is only
+// installed while sar_disable_viewmodel_shadows is on (the hook above
+// removes itself once it is turned off).
+ON_EVENT(FRAME) {
+	if (sar_disable_viewmodel_shadows.GetBool()) g_AddShadowToReceiverHook.Enable();
+}
 
 static void (*MsgPreSkipToNextLevel)();
 
@@ -1231,7 +1239,7 @@ bool Client::Init() {
 		Client::AddShadowToReceiver = (decltype(Client::AddShadowToReceiver))Memory::Scan(client->Name(), Offsets::AddShadowToReceiver);
 	}
 
-	g_AddShadowToReceiverHook.SetFunc(Client::AddShadowToReceiver);
+	g_AddShadowToReceiverHook.SetFunc(Client::AddShadowToReceiver, false);
 
 	UTIL_Portal_Color = (decltype(UTIL_Portal_Color))Memory::Scan(client->Name(), Offsets::UTIL_Portal_Color);
 	UTIL_Portal_Color_Particles = (decltype(UTIL_Portal_Color_Particles))Memory::Scan(client->Name(), Offsets::UTIL_Portal_Color_Particles);
