@@ -863,20 +863,56 @@ namespace {
 	// Mapping a registered surface can fail now and then (seen once in a
 	// full-game render: INVALID_PARAM right after a map load). One failure
 	// used to end the whole render; registering the surface again recovers.
+	// Copies the slot's frame into a new surface and registers that instead
+	bool nvReplaceSurface(NvSlot &sl) {
+		IDirect3DSurface9 *rt = nullptr;
+		D3DSURFACE_DESC desc;
+		if (!sl.rt || FAILED(sl.rt->GetDesc(&desc))) return false;
+		if (FAILED(g_device->CreateRenderTarget(desc.Width, desc.Height, desc.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &rt, NULL))) return false;
+		if (FAILED(g_device->StretchRect(sl.rt, NULL, rt, NULL, D3DTEXF_NONE))) {
+			rt->Release();
+			return false;
+		}
+		if (sl.reg) g_nv.fn.nvEncUnregisterResource(g_nv.enc, sl.reg);
+		sl.reg = nullptr;
+		sl.rt->Release();
+		sl.rt = rt;
+		return nvRegister(sl) == NV_ENC_SUCCESS;
+	}
+
+	// Mapping a registered surface sometimes fails right after a map load
+	// (INVALID_PARAM, "EncodeAPI Internal Error") and can keep failing for
+	// a while. One failure used to end the whole render: register the
+	// surface again with growing pauses (~2s in all), then try a new copy
+	// of the surface, before giving up.
 	NVENCSTATUS nvMap(NvSlot &sl, NV_ENC_MAP_INPUT_RESOURCE &mp) {
+		static const int pausesMs[] = {0, 1, 2, 5, 10, 20, 50, 100, 200, 300, 500, 1000};
 		auto &fn = g_nv.fn;
 		NVENCSTATUS st = NV_ENC_ERR_INVALID_PARAM;
-		for (int attempt = 0; attempt < 3; ++attempt) {
+		int64_t t0 = RendererCore::NowMicros();
+		int attempts = sizeof pausesMs / sizeof pausesMs[0];
+		for (int attempt = 0; attempt <= attempts; ++attempt) {
 			if (attempt > 0) {
-				Sleep(attempt);
-				if (sl.reg) fn.nvEncUnregisterResource(g_nv.enc, sl.reg);
-				if (nvRegister(sl) != NV_ENC_SUCCESS) continue;
-				++g_nv.remaps;
+				bool registered;
+				if (attempt < attempts) {
+					Sleep(pausesMs[attempt]);
+					if (sl.reg) fn.nvEncUnregisterResource(g_nv.enc, sl.reg);
+					registered = nvRegister(sl) == NV_ENC_SUCCESS;
+				} else {
+					registered = nvReplaceSurface(sl);
+				}
+				if (!registered) continue;
 			}
 			mp = {NV_ENC_MAP_INPUT_RESOURCE_VER};
 			mp.registeredResource = sl.reg;
 			st = fn.nvEncMapInputResource(g_nv.enc, &mp);
-			if (st == NV_ENC_SUCCESS) break;
+			if (st == NV_ENC_SUCCESS) {
+				if (attempt > 0) {
+					++g_nv.remaps;
+					THREAD_PRINT("[render] NVENC: input surface map failed, recovered after %d tries (%.0fms%s)\n", attempt, (RendererCore::NowMicros() - t0) / 1000.0, attempt == attempts ? ", new surface" : "");
+				}
+				break;
+			}
 		}
 		return st;
 	}
