@@ -1959,6 +1959,27 @@ ON_EVENT(DEMO_STOP) {
 	}
 }
 
+// The render resumes when a co-op transition video starts fading out, but
+// the fade runs on the wall clock, and renders run many times faster than
+// real time: the fading loading screen covered seconds of gameplay in the
+// video. While rendering, close it at once instead.
+void Renderer::OnTransitionVideoFadeout() {
+	if (g_render.isRendering.load() && engine->GetMaxClients() >= 2 && sar_render_skip_coop_videos.GetBool()) {
+		engine->ExecuteCommand("stopvideos");
+	}
+}
+
+// A co-op level transition pauses the render until the next demo starts
+// (sar_render_skip_coop_videos), but a demo spliced from several maps goes
+// on to the next map without a new playdemo, so the rest of it was played
+// without being rendered. A new map within the same demo resumes the render
+// the way a demo start does: once the map's intro fade has begun.
+ON_EVENT(SESSION_START) {
+	if (g_render.isRendering.load() && g_render.isPaused.load() && engine->demoplayer->IsPlaying()) {
+		Renderer::isDemoLoading = true;
+	}
+}
+
 // Init {{{
 
 void Renderer::Init(void **videomode) {

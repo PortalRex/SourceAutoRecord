@@ -571,6 +571,7 @@ DETOUR_COMMAND(Engine::playvideo_end_level_transition) {
 DETOUR_COMMAND(Engine::stop_transition_videos_fadeout) {
 	engine->startedTransitionFadeout = true;
 	Engine::stop_transition_videos_fadeout_callback(args);
+	Renderer::OnTransitionVideoFadeout();
 }
 DETOUR_COMMAND(Engine::load) {
 	// Loading a save should bypass ghost_sync if there's no map
