@@ -453,6 +453,15 @@ DETOUR(Engine::ReadCustomData, int *callbackIndex, char **data) {
 
 DETOUR_T(const char *, Engine::ReadConsoleCommand) {
 	const char *cmd = Engine::ReadConsoleCommand(thisptr);
+	// Players skip videos (the co-op intro, transition videos) with
+	// stopvideos, but recorded commands run as if the server sent them, and
+	// the engine refuses this one from the server: in a render the video
+	// played on over the gameplay that followed. Run the recorded skip as a
+	// local command instead.
+	if (Renderer::IsRunning() && cmd && !strncmp(cmd, "stopvideos", 10) && (cmd[10] == '\0' || cmd[10] == ' ' || cmd[10] == ';') && engine->demoplayer->IsPlaybackFixReady()) {
+		engine->ExecuteCommand("stopvideos", true);
+		return "";
+	}
 	if (engine->demoplayer->ShouldBlacklistCommand(cmd)) {
 		return "";
 	}
