@@ -5,6 +5,7 @@
 #include "Utils/SDK.hpp"
 
 #include <string>
+#include <map>
 #include <vector>
 
 struct ServerClass;
@@ -84,7 +85,7 @@ private:
 	void Emit(SarProof::RecordType type, const SarProof::ByteWriter &payload);
 	void EmitRaw(const std::vector<uint8_t> &record);
 	void Flush(bool force);
-	void BeginSegment(bool midStart);
+	void BeginSegment(bool midStart, bool requestFullUpdate = true);
 	void EndSegment(const char *why);
 	void Sync();
 	void WriteDatatables();
@@ -93,7 +94,7 @@ private:
 	void WriteFullStringTableSync();
 	void ResetEntities();
 	bool EncodeEntity(int index, ServerClass *cls, void *edict, EntState &out);
-	bool EnsureBaseline(ServerClass *cls, const EntState &st);
+	const std::vector<uint8_t> *Baseline(ServerClass *cls, const EntState &st);
 	void Event(SarProof::EventKind kind, const std::string &text);
 	std::vector<uint8_t> BuildPacketPayload(uint8_t flags);
 
@@ -134,7 +135,15 @@ private:
 	std::vector<uint32_t> entBuf;
 	std::vector<uint8_t> encBuf;
 	std::vector<int> propsA, propsB;
-	std::vector<std::pair<int, std::vector<uint8_t>>> emittedBaselines;  // instancebaseline index -> data, not yet mirrored
+	// Instance baselines. The backdoor never needs them, so the server only has
+	// them for classes that existed at map load; entering entities of other
+	// classes get one synthesized in the proof (the game is never touched).
+	std::map<int, std::vector<uint8_t>> synthBaselines;  // class id -> data
+	int baselineCount = 0;                               // entries in the demo's instancebaseline table
+	int baselineLiveStart = 0;                           // client entries when the segment began
+	std::map<int, int> baselineIndexMap;                 // later client entries -> demo index
+	std::vector<uint8_t> baselineScratch;
+	bool lastPacketBackdoor = false;
 };
 
 extern ProofRecorder *proofRecorder;

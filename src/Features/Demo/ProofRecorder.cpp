@@ -72,6 +72,7 @@ Variable sar_proof_replace_demos("sar_proof_replace_demos", "0",
 #define ST_ADDSTRING 8
 #define ST_GETSTRING 9
 #define ST_GETSTRINGUSERDATA 11
+#define ST_FINDSTRINGINDEX 12
 
 // old_bf_write as the engine lays it out
 struct EngineBfWrite {
@@ -453,7 +454,7 @@ void ProofRecorder::Stop(const char *why) {
 
 // ---- segments ----
 
-void ProofRecorder::BeginSegment(bool midStart) {
+void ProofRecorder::BeginSegment(bool midStart, bool requestFullUpdate) {
 	this->segmentActive = true;
 	this->synced = false;
 	this->initialSarDataPending = false;
@@ -490,14 +491,17 @@ void ProofRecorder::BeginSegment(bool midStart) {
 	this->needKeyframe = true;
 	this->sawNetworkMode = false;
 	this->lastEntTick = -1;
-	this->emittedBaselines.clear();
+	this->synthBaselines.clear();
+	this->baselineIndexMap.clear();
+	void *baselines = VCall<void *>(g_clientStringTables, STC_FINDTABLE, "instancebaseline");
+	this->baselineLiveStart = this->baselineCount = baselines ? VCall<int>(baselines, ST_GETNUMSTRINGS) : 0;
 
 	if (midStart) {
 		this->Sync();
 		this->WriteFullStringTableSync();
 		if (this->BackdoorActive()) {
 			this->Event(EV_KEYFRAME, "recording started mid-map; entity keyframe from the local backdoor");
-		} else if (ForceFullUpdate && engine->cl) {
+		} else if (requestFullUpdate && ForceFullUpdate && engine->cl) {
 			// no backdoor to copy from (multiplayer): ask the server for a full
 			// update, like a demo start does
 			ForceFullUpdate(engine->cl->ThisPtr(), "SAR proof");
@@ -677,8 +681,18 @@ void ProofRecorder::OnRecordPacket() {
 		CostTimer timer(this->costPackets);
 		uint8_t flags = 0;
 		if (this->inSignon) flags |= PKT_SIGNON;
-		if (this->BackdoorActive()) flags |= PKT_BACKDOOR;
+		bool backdoor = this->BackdoorActive();
+		if (backdoor) flags |= PKT_BACKDOOR;
 		else if (!this->inSignon) this->sawNetworkMode = true;
+		if (!backdoor && this->lastPacketBackdoor && !this->inSignon && this->segmentActive && !this->synthBaselines.empty()) {
+			// networking switched on (e.g. a demo started recording). Its string
+			// table updates would collide with the baselines synthesized for
+			// this segment, so continue in a new segment; the engine has
+			// already asked for the full update a mid-map start needs.
+			this->EndSegment("networking switched on");
+			this->BeginSegment(true, false);
+		}
+		this->lastPacketBackdoor = backdoor;
 		auto payload = this->BuildPacketPayload(flags);
 		if (this->inSignon) {
 			this->signonPackets.push_back(std::move(payload));
@@ -762,18 +776,22 @@ void ProofRecorder::OnStringTableDirectUpdate(void *container, int tick) {
 				if (!cdata) clen = 0;
 				if (slen == clen && (slen == 0 || !memcmp(sdata, cdata, slen))) continue;
 			}
-			if (baselines) {
-				// already recorded when the entity that needed it entered
-				auto it = std::find_if(this->emittedBaselines.begin(), this->emittedBaselines.end(), [&](auto &b) { return b.first == i; });
-				if (it != this->emittedBaselines.end()) {
-					bool same = (int)it->second.size() == slen && (slen == 0 || !memcmp(it->second.data(), sdata, slen));
-					this->emittedBaselines.erase(it);
-					if (same) continue;
+			int index = i;
+			bool addToDemo = isNew;
+			if (baselines && i >= this->baselineLiveStart) {
+				// the demo's table may already have synthesized entries here
+				auto it = this->baselineIndexMap.find(i);
+				if (it == this->baselineIndexMap.end()) {
+					index = this->baselineIndexMap[i] = this->baselineCount++;
+					addToDemo = true;
+				} else {
+					index = it->second;
+					addToDemo = false;
 				}
 			}
-			entries.Var(i);
-			entries.U8((isNew ? STE_STRING : 0) | (slen > 0 ? STE_DATA : 0));
-			if (isNew) {
+			entries.Var(index);
+			entries.U8((addToDemo ? STE_STRING : 0) | (slen > 0 ? STE_DATA : 0));
+			if (addToDemo) {
 				auto str = VCall<const char *>(st, ST_GETSTRING, i);
 				entries.Str(str ? str : "");
 			}
@@ -814,31 +832,40 @@ bool ProofRecorder::EncodeEntity(int index, ServerClass *cls, void *edict, EntSt
 	return true;
 }
 
-// SV_EnsureInstanceBaseline: entering entities are encoded against their
-// class's instance baseline, which the backdoor never needs (so the server
-// only has baselines for classes that existed at map load). Add missing ones
-// the way the server does when it networks an entity.
-bool ProofRecorder::EnsureBaseline(ServerClass *cls, const EntState &st) {
-	if (cls->m_InstanceBaselineIndex != INVALID_STRING_INDEX) return true;
-	void *table = VCall<void *>(g_serverStringTables, STC_FINDTABLE, "instancebaseline");
-	if (!table) return false;
+// The class baseline an entering entity is encoded against: the client's
+// instance baseline when it has one, otherwise one synthesized for the demo
+// from this entity's state (what SV_EnsureInstanceBaseline does when the
+// server networks an entity). The game's own tables are never changed:
+// adding a baseline the backdoor would never mirror leaves server and client
+// disagreeing, which breaks the game if networking switches on later.
+const std::vector<uint8_t> *ProofRecorder::Baseline(ServerClass *cls, const EntState &st) {
 	char id[16];
 	snprintf(id, sizeof id, "%d", cls->m_ClassID);
-	int idx = VCall<int>(table, ST_ADDSTRING, true, (const char *)id, (int)st.state.size(), (const void *)st.state.data());
-	if (idx < 0 || idx == INVALID_STRING_INDEX) return false;
-	cls->m_InstanceBaselineIndex = idx;
+	void *ct = VCall<void *>(g_clientStringTables, STC_FINDTABLE, "instancebaseline");
+	if (ct) {
+		int idx = VCall<int>(ct, ST_FINDSTRINGINDEX, (const char *)id);
+		if (idx >= 0 && idx != INVALID_STRING_INDEX) {
+			int len = 0;
+			auto data = VCall<const uint8_t *>(ct, ST_GETSTRINGUSERDATA, idx, &len);
+			if (data && len > 0) {
+				this->baselineScratch.assign(data, data + len);
+				return &this->baselineScratch;
+			}
+		}
+	}
+	auto it = this->synthBaselines.find(cls->m_ClassID);
+	if (it != this->synthBaselines.end()) return &it->second;
 
 	ByteWriter w;
 	w.I32(-1);
 	w.Str("instancebaseline");
 	w.Var(1);
-	w.Var(idx);
+	w.Var(this->baselineCount++);
 	w.U8(STE_STRING | STE_DATA);
 	w.Str(id);
 	w.Blob(st.state.data(), st.state.size());
 	this->Emit(REC_STRINGTABLE, w);
-	this->emittedBaselines.push_back({idx, st.state});
-	return true;
+	return &(this->synthBaselines[cls->m_ClassID] = st.state);
 }
 
 // Called inside SV_ComputeClientPacks right after the backdoor has copied this
@@ -891,18 +918,12 @@ void ProofRecorder::OnEndEntityStateUpdate(void *backdoor) {
 		if (inNow && (isCreated[i] || !inPrev || serialNow != e.serial)) {
 			// enter PVS: delta from the class baseline, every prop (SV_WriteEnterPVS)
 			EntState ns;
-			if (!this->EncodeEntity(i, cls, edict, ns) || !this->EnsureBaseline(cls, ns)) {
+			const std::vector<uint8_t> *base = nullptr;
+			if (!this->EncodeEntity(i, cls, edict, ns) || !(base = this->Baseline(cls, ns))) {
 				failed = true;
 				break;
 			}
-			void *table = VCall<void *>(g_serverStringTables, STC_FINDTABLE, "instancebaseline");
-			int baseLen = 0;
-			auto base = table ? VCall<const void *>(table, ST_GETSTRINGUSERDATA, cls->m_InstanceBaselineIndex, &baseLen) : nullptr;
-			if (!base) {
-				failed = true;
-				break;
-			}
-			int n = SendTable_CalcDelta(cls->m_pTable, base, baseLen * 8, ns.state.data(), ns.bits, this->propsA.data(), MAX_DELTA_PROPS, i);
+			int n = SendTable_CalcDelta(cls->m_pTable, base->data(), (int)base->size() * 8, ns.state.data(), ns.bits, this->propsA.data(), MAX_DELTA_PROPS, i);
 			bf.UBitVar(i - last - 1);
 			bf.Bit(0);
 			bf.Bit(1);
