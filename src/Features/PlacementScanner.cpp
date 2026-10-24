@@ -849,6 +849,9 @@ Variable sar_pp_live_color_bumped("sar_pp_live_color_bumped", "230 190 60", "Liv
 Variable sar_pp_live_opacity("sar_pp_live_opacity", "110", 0, 255, "Opacity of the live overlay.\n");
 Variable sar_pp_live_draw_dist("sar_pp_live_draw_dist", "1500", 0, "Live overlay: results further than this from you aren't drawn.\n");
 Variable sar_pp_live_eye_move("sar_pp_live_eye_move", "1", 0, "Live overlay mode 2: how far in units your eyes can move before the results are tested again.\n");
+Variable sar_pp_live_unreliable("sar_pp_live_unreliable", "1", 0, 1, "Live overlay: where results change between neighboring points, test slightly shifted aims too and mark the point unreliable if they disagree (the result depends on your exact aim).\n");
+Variable sar_pp_live_color_unreliable("sar_pp_live_color_unreliable", "190 120 255", "Live overlay color where whether a portal lands depends on your exact aim.\n");
+Variable sar_pp_live_show_fail("sar_pp_live_show_fail", "0", 0, 1, "Live overlay: also paint where portals fail (in sar_pp_scan_color_fail). Off shows only where they land.\n");
 
 #define LIVE_FLOOR_YAW_STEP 15.0f  // floor results are kept per facing direction, in these steps
 #define LIVE_MAX_POINTS 400000     // the results are cleared beyond this
@@ -858,9 +861,17 @@ enum LiveResult : uint8_t {
 	LIVE_FAIL = 1,
 	LIVE_BUMPED = 2,
 	LIVE_SUCCESS = 3,
-	LIVE_EMPTY = 4,     // no surface there (a gap, or inside a wall); not drawn
-	LIVE_STALE = 0x80,  // mode 2: tested from an old eye position
+	LIVE_EMPTY = 4,       // no surface there (a gap, or inside a wall); not drawn
+	LIVE_UNRELIABLE = 5,  // lands or not depending on the exact aim
+	LIVE_CLASS = 0x0F,    // the bits above
+	LIVE_CHECKED = 0x40,  // shifted aims were tested (see liveCheckAim)
+	LIVE_STALE = 0x80,    // tested before something changed; test again
 };
+
+static bool liveLands(uint8_t r) {
+	r &= LIVE_CLASS;
+	return r == LIVE_BUMPED || r == LIVE_SUCCESS;
+}
 
 struct LivePlane {
 	Vector normal;
@@ -885,6 +896,7 @@ static struct {
 	// settings the results were made with
 	int mode, step, portals;
 	float spacing, tolerance;
+	bool unreliable;
 	Vector eye;
 	// the player's portals, which change where new ones can go
 	Vector portalPos[2];
@@ -944,8 +956,8 @@ static bool liveSurfaceAt(const LivePlane &pl, Vector target) {
 	return tr.plane.normal.Dot(pl.normal) > 0.99f && fabsf(tr.endpos.Dot(pl.normal) - pl.dist) < 0.5f;
 }
 
-static uint8_t liveTest(uintptr_t portalgun, const LivePlane &pl, int i, int j, bool verbose = false) {
-	Vector target = livePoint(pl, (float)i, (float)j);
+static uint8_t liveTestAt(uintptr_t portalgun, const LivePlane &pl, float i, float j, bool verbose = false) {
+	Vector target = livePoint(pl, i, j);
 	if (!liveSurfaceAt(pl, target)) return LIVE_EMPTY;
 	Vector origin, dir;
 	if (g_live.mode == 2) {
@@ -987,14 +999,42 @@ static uint8_t liveTest(uintptr_t portalgun, const LivePlane &pl, int i, int j, 
 	return moved ? LIVE_BUMPED : LIVE_SUCCESS;
 }
 
+static uint8_t liveTest(uintptr_t portalgun, const LivePlane &pl, int i, int j, bool verbose = false) {
+	return liveTestAt(portalgun, pl, (float)i, (float)j, verbose);
+}
+
 // The result at a grid point, testing it if it isn't known (or is stale)
 static uint8_t liveSample(uintptr_t portalgun, LivePlane &pl, int i, int j, bool &tested) {
 	auto [it, added] = pl.points.try_emplace(liveKey(i, j), (uint8_t)LIVE_UNKNOWN);
 	if (added) ++g_live.pointCount;
-	if (it->second != LIVE_UNKNOWN && !(it->second & LIVE_STALE)) return it->second;
+	if (it->second != LIVE_UNKNOWN && !(it->second & LIVE_STALE)) return it->second & LIVE_CLASS;
 	it->second = liveTest(portalgun, pl, i, j);
 	tested = true;
 	return it->second;
+}
+
+// At a point next to one with a different result, tests aims shifted a
+// quarter of the spacing each way. Near small surfaces the game's bumping can
+// flip between landing and failing over fractions of a unit, so if any of
+// them disagrees the point is marked unreliable.
+static void liveCheckAim(uintptr_t portalgun, LivePlane &pl, int i, int j, bool &tested) {
+	if (!sar_pp_live_unreliable.GetBool()) return;
+	auto it = pl.points.find(liveKey(i, j));
+	if (it == pl.points.end() || (it->second & (LIVE_CHECKED | LIVE_STALE))) return;
+	uint8_t r = it->second & LIVE_CLASS;
+	if (r == LIVE_UNKNOWN || r == LIVE_EMPTY || r == LIVE_UNRELIABLE) return;
+
+	static const float offsets[4][2] = {{-0.25f, -0.25f}, {0.25f, -0.25f}, {-0.25f, 0.25f}, {0.25f, 0.25f}};
+	bool differs = false;
+	for (auto &o : offsets) {
+		uint8_t shifted = liveTestAt(portalgun, pl, i + o[0], j + o[1]);
+		tested = true;
+		if (shifted != LIVE_EMPTY && liveLands(shifted) != liveLands(r)) {
+			differs = true;
+			break;
+		}
+	}
+	it->second = (differs ? LIVE_UNRELIABLE : r) | LIVE_CHECKED;
 }
 
 // Refines one coarse cell; false if time ran out first
@@ -1009,10 +1049,14 @@ static bool liveRefine(uintptr_t portalgun, LivePlane &pl, int x0, int y0, int x
 		stack.pop_back();
 
 		bool tested = false;
-		uint8_t r = liveSample(portalgun, pl, c.x0, c.y0, tested);
-		bool same = liveSample(portalgun, pl, c.x1, c.y0, tested) == r;
-		same &= liveSample(portalgun, pl, c.x0, c.y1, tested) == r;
-		same &= liveSample(portalgun, pl, c.x1, c.y1, tested) == r;
+		uint8_t corners[4] = {
+			liveSample(portalgun, pl, c.x0, c.y0, tested),
+			liveSample(portalgun, pl, c.x1, c.y0, tested),
+			liveSample(portalgun, pl, c.x0, c.y1, tested),
+			liveSample(portalgun, pl, c.x1, c.y1, tested),
+		};
+		uint8_t r = corners[0];
+		bool same = corners[1] == r && corners[2] == r && corners[3] == r;
 
 		if (same) {
 			for (int j = c.y0; j <= c.y1; ++j) {
@@ -1035,6 +1079,19 @@ static bool liveRefine(uintptr_t portalgun, LivePlane &pl, int x0, int y0, int x
 				if (splitX) stack.push_back({xm, c.y0, c.x1, ym});
 				if (splitY) stack.push_back({c.x0, ym, xm, c.y1});
 				if (splitX && splitY) stack.push_back({xm, ym, c.x1, c.y1});
+			} else {
+				// neighboring points: where landing changes, check the aim
+				bool lands = false, fails = false;
+				for (uint8_t v : corners) {
+					if (v == LIVE_EMPTY || v == LIVE_UNRELIABLE) continue;
+					(liveLands(v) ? lands : fails) = true;
+				}
+				if (lands && fails) {
+					liveCheckAim(portalgun, pl, c.x0, c.y0, tested);
+					liveCheckAim(portalgun, pl, c.x1, c.y0, tested);
+					liveCheckAim(portalgun, pl, c.x0, c.y1, tested);
+					liveCheckAim(portalgun, pl, c.x1, c.y1, tested);
+				}
 			}
 		}
 
@@ -1054,7 +1111,9 @@ static void liveCheckSettings() {
 	int portals = sar_pp_scan_portal.GetInt();
 	float spacing = sar_pp_live_spacing.GetFloat();
 	float tolerance = sar_pp_live_tolerance.GetFloat();
-	if (mode != g_live.mode || step != g_live.step || portals != g_live.portals || spacing != g_live.spacing || tolerance != g_live.tolerance) {
+	bool unreliable = sar_pp_live_unreliable.GetBool();
+	if (mode != g_live.mode || step != g_live.step || portals != g_live.portals || spacing != g_live.spacing || tolerance != g_live.tolerance || unreliable != g_live.unreliable) {
+		g_live.unreliable = unreliable;
 		liveClear();
 		g_live.mode = mode;
 		g_live.step = step;
@@ -1158,7 +1217,21 @@ static void liveUpdate() {
 			for (int b = -r; b <= r; ++b) {
 				if (abs(a) != r && abs(b) != r) continue;
 				bool tested = false;
-				liveSample(portalgun, pl, (ci + a) * k, (cj + b) * k, tested);
+				int i = (ci + a) * k, j = (cj + b) * k;
+				uint8_t v = liveSample(portalgun, pl, i, j, tested);
+				if (k == 1 && v != LIVE_EMPTY && v != LIVE_UNRELIABLE) {
+					// no refinement pass to find where landing changes, so
+					// compare with the neighbors here
+					static const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+					for (auto &d : dirs) {
+						auto n = pl.points.find(liveKey(i + d[0], j + d[1]));
+						if (n == pl.points.end() || (n->second & LIVE_STALE)) continue;
+						uint8_t nv = n->second & LIVE_CLASS;
+						if (nv == LIVE_UNKNOWN || nv == LIVE_EMPTY || nv == LIVE_UNRELIABLE || liveLands(nv) == liveLands(v)) continue;
+						liveCheckAim(portalgun, pl, i, j, tested);
+						liveCheckAim(portalgun, pl, i + d[0], j + d[1], tested);
+					}
+				}
 				if (tested && timeUp()) {
 					out = true;
 					break;
@@ -1210,12 +1283,14 @@ static void liveDraw() {
 	if (g_live.planes.empty()) return;
 
 	uint8_t alpha = (uint8_t)sar_pp_live_opacity.GetInt();
-	Color colors[5];
+	Color colors[6];
 	colors[LIVE_FAIL] = Utils::GetColor(sar_pp_scan_color_fail.GetString(), false).value_or(Color(255, 0, 0));
 	colors[LIVE_BUMPED] = Utils::GetColor(sar_pp_live_color_bumped.GetString(), false).value_or(Color(230, 190, 60));
 	colors[LIVE_SUCCESS] = Utils::GetColor(sar_pp_scan_color_success.GetString(), false).value_or(Color(0, 255, 0));
-	MeshId meshes[5];
-	bool hasMesh[5] = {};
+	colors[LIVE_UNRELIABLE] = Utils::GetColor(sar_pp_live_color_unreliable.GetString(), false).value_or(Color(190, 120, 255));
+	bool showFail = sar_pp_live_show_fail.GetBool();
+	MeshId meshes[6];
+	bool hasMesh[6] = {};
 
 	Vector cam = camera->GetPosition(GET_SLOT());
 	float drawDist = sar_pp_live_draw_dist.GetFloat();
@@ -1226,7 +1301,7 @@ static void liveDraw() {
 
 		// one quad per run of equal results along a row
 		auto flush = [&](int i0, int i1, int j, uint8_t r) {
-			if (r == LIVE_UNKNOWN || r == LIVE_EMPTY) return;
+			if (r == LIVE_UNKNOWN || r == LIVE_EMPTY || (r == LIVE_FAIL && !showFail)) return;
 			Vector a = livePoint(pl, i0 - 0.5f, j - 0.5f);
 			if ((a - cam).Length() > drawDist) return;
 			Vector b = livePoint(pl, i1 + 0.5f, j - 0.5f);
@@ -1247,7 +1322,7 @@ static void liveDraw() {
 		for (auto &[pkey, value] : pl.points) {
 			int i, j;
 			liveUnkey(pkey, i, j);
-			uint8_t r = value & ~LIVE_STALE;
+			uint8_t r = value & LIVE_CLASS;
 			if (inRun && j == runJ && i == runI1 + 1 && r == runR) {
 				runI1 = i;
 				continue;
@@ -1325,7 +1400,7 @@ CON_COMMAND(sar_pp_live_debug, "sar_pp_live_debug - print the placement test res
 				info.finalPos.x, info.finalPos.y, info.finalPos.z, info.finalPos.Dot(n) - dist, (info.finalPos - target).Length());
 		}
 	}
-	static const char *liveNames[] = {"unknown", "fail (red)", "bumped (yellow)", "success (green)", "no surface (not drawn)"};
+	static const char *liveNames[] = {"unknown", "fail (red)", "bumped (yellow)", "success (green)", "no surface (not drawn)", "unreliable (purple)"};
 	console->Print("sar_pp_scan_portal %d (%s)\n", sar_pp_scan_portal.GetInt(), sar_pp_scan_portal.GetInt() == 0 ? "blue" : sar_pp_scan_portal.GetInt() == 1 ? "orange" : "both");
 	if (sar_pp_live.GetBool() && g_live.hasCurrent) {
 		LivePlane &pl = g_live.planes[g_live.current];
@@ -1334,7 +1409,7 @@ CON_COMMAND(sar_pp_live_debug, "sar_pp_live_debug - print the placement test res
 		auto it = pl.points.find(liveKey(i, j));
 		uint8_t cached = it == pl.points.end() ? LIVE_UNKNOWN : it->second;
 		uint8_t now = liveTest(portalgun, pl, i, j, true);
-		console->Print("overlay at (%d, %d): shown %s%s, tested now %s\n", i, j, liveNames[cached & ~LIVE_STALE], cached & LIVE_STALE ? " (stale)" : "", liveNames[now]);
+		console->Print("overlay at (%d, %d): shown %s%s, tested now %s\n", i, j, liveNames[cached & LIVE_CLASS], cached & LIVE_STALE ? " (stale)" : "", liveNames[now]);
 	}
 	returnPortalGun(gun);
 }
