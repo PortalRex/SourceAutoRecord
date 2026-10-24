@@ -951,7 +951,7 @@ CON_COMMAND_F(seq, "seq <commands>... - runs a sequence of commands one tick aft
 	std::queue<std::string> cmds;
 	for (int i = 1; i < args.ArgC(); ++i) {
 		cmds.push(std::string(args[i]));
-		if (engine->demorecorder->isRecordingDemo && *args[i]) {
+		if (engine->demorecorder->WantsSarData() && *args[i]) {
 			size_t size = strlen(args[i]) + 6;
 			char *data = new char[size];
 			data[0] = 0x09;

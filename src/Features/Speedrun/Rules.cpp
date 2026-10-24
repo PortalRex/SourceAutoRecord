@@ -530,7 +530,7 @@ void SpeedrunTimer::TickRules() {
 				// Portal position changed
 				SpeedrunTimer::TestPortalRules(pos, slot, i ? PortalColor::ORANGE : PortalColor::BLUE);
 				portalPositions[slot][i] = pos;
-				if (engine->demorecorder->isRecordingDemo) {
+				if (engine->demorecorder->WantsSarData()) {
 					// Record in demo
 					char data[15];
 					data[0] = 0x05;
@@ -562,7 +562,7 @@ void SpeedrunTimer::TickRules() {
 		bool fly = m_nTractorBeamCount > 0 && m_hTractorBeam == (unsigned)Offsets::INVALID_EHANDLE_INDEX;
 
 		if (fly && !flyStates[slot]) {
-			if (engine->demorecorder->isRecordingDemo) {
+			if (engine->demorecorder->WantsSarData()) {
 				char data[2] = {0x07, (char)slot};
 				engine->demorecorder->RecordData(data, sizeof data);
 			}

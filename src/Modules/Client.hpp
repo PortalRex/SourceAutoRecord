@@ -28,6 +28,8 @@ private:
 	Interface *g_GameMovement = nullptr;
 
 public:
+	Interface *Input() { return this->g_Input; }
+
 	DECL_M(GetAbsOrigin, Vector);
 	DECL_M(GetAbsAngles, QAngle);
 	DECL_M(GetLocalVelocity, Vector);
@@ -99,6 +101,9 @@ public:
 
 public:
 	// CBaseModPanel::GetChapterProgress
+	// CHLClient::FrameStageNotify
+	DECL_DETOUR(FrameStageNotifyDetour, int stage);
+
 	DECL_DETOUR(GetChapterProgress);
 
 	// BaseModUI::CPortalLeaderboardPanel::OnCommand

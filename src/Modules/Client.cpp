@@ -7,6 +7,7 @@
 #include "Features/AutoSubmit.hpp"
 #include "Features/Camera.hpp"
 #include "Features/Demo/DemoGhostPlayer.hpp"
+#include "Features/Demo/ProofRecorder.hpp"
 #include "Features/Demo/NetworkGhostPlayer.hpp"
 #include "Features/FovChanger.hpp"
 #include "Features/GroundFramesCounter.hpp"
@@ -97,6 +98,7 @@ Variable sar_portalcolor_mp2_2("sar_portalcolor_mp2_2", "57 2 2",     "Portal co
 Variable sar_portalcolor_rainbow("sar_portalcolor_rainbow", "0", "Rainbow portals!\n");
 
 REDECL(Client::LevelInitPreEntity);
+REDECL(Client::FrameStageNotifyDetour);
 REDECL(Client::CreateMove);
 REDECL(Client::CreateMove2);
 REDECL(Client::GetName);
@@ -662,9 +664,18 @@ DETOUR(Client::DecodeUserCmdFromBuffer, int nSlot, int buf, signed int sequence_
 	return result;
 }
 
+// CHLClient::FrameStageNotify
+DETOUR(Client::FrameStageNotifyDetour, int stage) {
+	auto result = Client::FrameStageNotifyDetour(thisptr, stage);
+	if (proofRecorder) proofRecorder->OnClientFrameStage(stage);
+	return result;
+}
+
 // CInput::CreateMove
 DETOUR(Client::CInput_CreateMove, int sequence_number, float input_sample_frametime, bool active) {
 	auto result = Client::CInput_CreateMove(thisptr, sequence_number, input_sample_frametime, active);
+
+	if (proofRecorder) proofRecorder->OnUserCmd(sequence_number);
 
 	return result;
 }
@@ -1048,6 +1059,7 @@ bool Client::Init() {
 		Client::ResetToneMapping = (Client::_ResetToneMapping)Memory::Scan(this->Name(), Offsets::ResetToneMapping);
 
 		this->g_ClientDLL->Hook(Client::LevelInitPreEntity_Hook, Client::LevelInitPreEntity, Offsets::LevelInitPreEntity);
+		this->g_ClientDLL->Hook(Client::FrameStageNotifyDetour_Hook, Client::FrameStageNotifyDetour, Offsets::GetAllClasses + 27);
 
 		using _GetHud = void *(__cdecl *)(int unk);
 		using _FindElement = void *(__rescall *)(void *thisptr, const char *pName);

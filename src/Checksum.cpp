@@ -610,7 +610,9 @@ void RecordRuntimeVscriptChecksum(const char *scriptName, const char *scriptData
 		sum = crc32(scriptData, scriptLen);
 	}
 
-	if (engine->demorecorder->isRecordingDemo && engine->demorecorder->GetTick() >= 0) {
+	bool demoReady = engine->demorecorder->isRecordingDemo && engine->demorecorder->GetTick() >= 0;
+	bool proofReady = !engine->demorecorder->isRecordingDemo && engine->demorecorder->WantsSarData();
+	if (demoReady || proofReady) {
 		size_t nameLen = strlen(scriptName);
 		size_t bufLen = nameLen + 6;
 		auto *buf = new uint8_t[bufLen];

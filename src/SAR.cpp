@@ -121,6 +121,9 @@ bool SAR::Load(CreateInterfaceFn interfaceFactory, CreateInterfaceFn gameServerF
 				engine->demoplayer->Init();
 				engine->demorecorder->Init();
 
+				this->features->AddFeature<ProofRecorder>(&proofRecorder);
+				if (proofRecorder->Init()) engine->demorecorder->HookProofCallbacks();
+
 				LoadProfile::Step("demo player/recorder init");
 				this->cheats->Init();
 				LoadProfile::Step("cheats init");

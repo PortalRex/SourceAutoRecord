@@ -339,7 +339,7 @@ static void sendCoopPacket(PacketType t, std::string *splitName = NULL, int newS
 }
 
 void SpeedrunTimer::WriteIdToDemo() {
-	if (!engine->demorecorder->isRecordingDemo) return;
+	if (!engine->demorecorder->WantsSarData()) return;
 	if (!g_speedrun.hasSpeedrunId) return;
 
 	uint8_t data[17];
@@ -724,7 +724,7 @@ void SpeedrunTimer::Stop(std::string segName) {
 		networkManager.NotifySpeedrunFinished(false);
 	}
 
-	if (engine->demorecorder->isRecordingDemo) {
+	if (engine->demorecorder->WantsSarData()) {
 		recordDemoResult();
 	}
 

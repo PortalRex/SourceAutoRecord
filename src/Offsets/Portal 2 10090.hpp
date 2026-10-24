@@ -487,6 +487,24 @@ SIGSCAN_DEFAULT(StartupDemoFile, "55 8B EC 81 EC 18 02 00 00 53 8B D9 80", "55 8
 OFFSET_DEFAULT(StartupDemoFile_HeaderName, 212, 184)
 
 
+// SAR proofs (Features/Demo/ProofRecorder.cpp). Windows only for now.
+SIGSCAN_DEFAULT(SendTable_Encode, "55 8B EC 81 EC 60 01 00 00 53 8B 1D ? ? ? ? 56", "") // "SendTable_Encode: Missing m_pPrecalc for SendTable %s."
+SIGSCAN_DEFAULT(SendTable_WritePropList, "55 8B EC 83 EC 50 53 8B 5D 14 53 8D 4D E4 E8 ? ? ? ? 83", "") // "SendTable_WritePropList->inputBuffer"
+SIGSCAN_DEFAULT(SendTable_CalcDelta, "55 8B EC 81 EC A4 00 00 00 33 C0 89 45 F0 89 45", "") // called by SV_PackEntity after SendTable_Encode
+SIGSCAN_DEFAULT(CullPropsFromProxies, "55 8B EC B8 48 41 00 00 E8 ? ? ? ? 56 57 8B", "") // "CullPropsFromProxies: overflow in '%s'."
+SIGSCAN_DEFAULT(DataTable_WriteSendTablesBuffer, "55 8B EC 53 8B 5D 08 56 57 53 E8 ? ? ? ? 8B", "") // called by CDemoRecorder::RecordServerClasses
+SIGSCAN_DEFAULT(DataTable_WriteClassInfosBuffer, "55 8B EC 56 8B 75 08 33 C9 57 8B C6 85 F6 74 08", "") // called by CDemoRecorder::RecordServerClasses
+SIGSCAN_DEFAULT(CDemoRecorder_GetClientCmdInfo, "55 8B EC 83 EC 10 53 57 33 FF 8B D9 39 3D ? ? ? ? 0F", "") // "cl_demo.cpp" splitscreen guard, writes FDEMO_NOINTERP
+SIGSCAN_DEFAULT(CBaseClientState_ForceFullUpdate, "55 8B EC 56 8B F1 83 BE CC 00 00 00 FF 74 21 E8", "") // "Requesting full game update (%s)...\n"
+SIGSCAN_DEFAULT(SV_ComputeClientPacks, "55 8B EC 83 EC 14 8B 0D ? ? ? ? FF 15 ? ? ? ? 88", "") // "SV_ComputeClientPacks"
+SIGSCAN_DEFAULT(PackEntities_NetworkBackDoor, "55 8B EC 51 8B 45 0C 8B 10 8B 4D 10 57 81 C2 74", "") // called by SV_ComputeClientPacks when the local backdoor is active
+SIGSCAN_DEFAULT(CLocalNetworkBackdoor_EndEntityStateUpdate, "55 8B EC 83 EC 14 53 56 57 8B F9 8B 0D ? ? ? ? 8B", "") // called by SV_ComputeClientPacks after PackEntities_NetworkBackDoor
+SIGSCAN_DEFAULT(CNetworkStringTableContainer_DirectUpdate, "55 8B EC 51 53 57 8B F9 8B 0D ? ? ? ? 83 B9 0C 10 00 00 00 0F 95 C0", "") // "CNetworkStringTableContainer::DirectUpdate"
+OFFSET_DEFAULT(RecordMessages, 10, 10)
+OFFSET_DEFAULT(RecordPacket, 11, 11)
+OFFSET_DEFAULT(ResetDemoInterpolation, 15, 15)
+
+
 // EngineDemoPlayer
 SIGSCAN_DEFAULT(InterpolateDemoCommand, "55 8B EC 83 EC 10 56 8B F1 8B 4D 10 57 8B BE B4 05 00 00 83 C1 04 89 75 F4 89 7D F0 E8 ? ? ? ? 8B 4D 14 83 C1 04",
                                         "55 57 56 53 83 EC 10 8B 44 24 24 8B 5C 24 2C 8B 88 B0 05 00 00 8B 44 24 30 8D 70 04 8D 90 9C 00 00 00 89 F0 F3 0F 10 40 04")

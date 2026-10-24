@@ -30,7 +30,7 @@ void wait_func(ConCommand* source, const CCommand &args, bool mode) {
 
 	const char *cmd = Utils::ArgContinuation(args, 2);
 
-	if (engine->demorecorder->isRecordingDemo) {
+	if (engine->demorecorder->WantsSarData()) {
 		size_t size = strlen(cmd) + 6;
 		char *data = new char[size];
 		data[0] = 0x09;
@@ -92,7 +92,7 @@ CON_COMMAND_F(hwait, "hwait <tick> <command> [args...] - run a command after the
 
 	std::string cmdstr = cmd;
 
-	if (engine->demorecorder->isRecordingDemo) {
+	if (engine->demorecorder->WantsSarData()) {
 		size_t size = cmdstr.size() + 6;
 		char *data = new char[size];
 		data[0] = 0x0D;

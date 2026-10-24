@@ -8,6 +8,7 @@
 #include "Game.hpp"
 #include "Scheduler.hpp"
 #include "Features/AutoSubmit.hpp"
+#include "Features/Demo/ProofRecorder.hpp"
 #include "Features/EntityList.hpp"
 #include "Features/FovChanger.hpp"
 #include "Features/Session.hpp"
@@ -28,8 +29,14 @@ REDECL(EngineDemoRecorder::SetSignonState);
 REDECL(EngineDemoRecorder::StartRecording);
 REDECL(EngineDemoRecorder::StopRecording);
 REDECL(EngineDemoRecorder::RecordCustomData);
+REDECL(EngineDemoRecorder::RecordCommand);
+REDECL(EngineDemoRecorder::RecordMessages);
+REDECL(EngineDemoRecorder::RecordPacket);
+REDECL(EngineDemoRecorder::ResetDemoInterpolation);
 REDECL(EngineDemoRecorder::stop_callback);
 REDECL(EngineDemoRecorder::record_callback);
+
+extern Variable sar_proof_replace_demos;
 
 Variable sar_demo_overwrite_bak("sar_demo_overwrite_bak", "0", 0, "Rename demos to (name)_bak if they would be overwritten by recording\n");
 
@@ -104,9 +111,8 @@ static void RecordQueuedCommands() {
 }
 
 static void RecordQueuedVScriptChecksums() {
-	if (!engine->demorecorder->isRecordingDemo) return;
-	if (!engine->demorecorder->customDataReady) return;
-	if (engine->demorecorder->GetTick() < 0) return;
+	if (!engine->demorecorder->WantsSarData()) return;
+	if (engine->demorecorder->isRecordingDemo && (!engine->demorecorder->customDataReady || engine->demorecorder->GetTick() < 0)) return;
 
 	for (auto &queuedChecksum : engine->demorecorder->queuedVScriptChecksums) {
 		size_t nameLen = queuedChecksum.first.size();
@@ -133,6 +139,38 @@ ON_EVENT(SESSION_END) {
 	if (*engine->demorecorder->m_bRecording && sar_autorecord.GetInt() == -1) {
 		engine->demorecorder->Stop();
 	}
+}
+
+void RecordSarInitialData() {
+	RecordTimestamp();
+	SpeedrunTimer::WriteIdToDemo();  // Write speedrun ID to every demo segment
+	RecordQueuedCommands();
+	RecordQueuedVScriptChecksums();
+	SpeedrunTimer::RecordIncompleteSummary();
+	engine->ExecuteCommand("echo \"SAR " SAR_VERSION " (Built " SAR_BUILT ")\"", true);
+	AddDemoFileChecksums();
+	AddDemoVpkChecksums();
+	/*
+	RecordInitialVal("host_timescale");
+	RecordInitialVal("m_yaw");
+	RecordInitialVal("cl_fov");
+	RecordInitialVal("sv_allow_mobile_portals");
+	RecordInitialVal("fps_max");
+	RecordInitialVal("sv_portal_placement_debug");
+	RecordInitialVal("sv_use_trace_duration");
+	RecordInitialVal("sv_alternateticks");
+	RecordInitialVal("cl_cmdrate");
+	RecordInitialVal("cl_updaterate");
+	*/
+	for (ConCommandBase *cmd = tier1->m_pConCommandList; cmd; cmd = cmd->m_pNext) {
+		if (!cmd->m_bRegistered) continue;
+		if (cmd->IsCommand()) continue;
+		if (cmd->m_nFlags & FCVAR_DONTRECORD) continue;
+		ConVar *var = (ConVar *)cmd;
+		if (!strcmp(var->m_pszString, var->m_pszDefaultValue)) continue;
+		RecordInitialVal(var->m_pszName, var->m_pszString);
+	}
+	if (proofRecorder) proofRecorder->InitialSarDataWritten();
 }
 
 // CDemoRecorder::SetSignonState
@@ -174,6 +212,8 @@ DETOUR(EngineDemoRecorder::SetSignonState, int state) {
 		engine->demorecorder->customDataReady = true;
 	}
 
+	if (proofRecorder) proofRecorder->OnSignonState(state);
+
 	auto result = EngineDemoRecorder::SetSignonState(thisptr, state);
 
 	if (wasRecording && state == SIGNONSTATE_NEW) {
@@ -193,36 +233,10 @@ DETOUR(EngineDemoRecorder::SetSignonState, int state) {
 		needToRecordInitialVals = true;
 	}
 
-	if (state == SIGNONSTATE_FULL && needToRecordInitialVals) {
+	bool proofWantsData = proofRecorder && proofRecorder->WantsInitialSarData();
+	if (state == SIGNONSTATE_FULL && (needToRecordInitialVals || proofWantsData)) {
 		needToRecordInitialVals = false;
-		RecordTimestamp();
-		SpeedrunTimer::WriteIdToDemo();  // Write speedrun ID to every demo segment
-		RecordQueuedCommands();
-		RecordQueuedVScriptChecksums();
-		SpeedrunTimer::RecordIncompleteSummary();
-		engine->ExecuteCommand("echo \"SAR " SAR_VERSION " (Built " SAR_BUILT ")\"", true);
-		AddDemoFileChecksums();
-		AddDemoVpkChecksums();
-		/*
-		RecordInitialVal("host_timescale");
-		RecordInitialVal("m_yaw");
-		RecordInitialVal("cl_fov");
-		RecordInitialVal("sv_allow_mobile_portals");
-		RecordInitialVal("fps_max");
-		RecordInitialVal("sv_portal_placement_debug");
-		RecordInitialVal("sv_use_trace_duration");
-		RecordInitialVal("sv_alternateticks");
-		RecordInitialVal("cl_cmdrate");
-		RecordInitialVal("cl_updaterate");
-		*/
-		for (ConCommandBase *cmd = tier1->m_pConCommandList; cmd; cmd = cmd->m_pNext) {
-			if (!cmd->m_bRegistered) continue;
-			if (cmd->IsCommand()) continue;
-			if (cmd->m_nFlags & FCVAR_DONTRECORD) continue;
-			ConVar *var = (ConVar *)cmd;
-			if (!strcmp(var->m_pszString, var->m_pszDefaultValue)) continue;
-			RecordInitialVal(var->m_pszName, var->m_pszString);
-		}
+		RecordSarInitialData();
 	}
 
 	return result;
@@ -312,7 +326,48 @@ DETOUR(EngineDemoRecorder::RecordCustomData, int id, const void *data, unsigned 
 	return EngineDemoRecorder::RecordCustomData(thisptr, id, data, length);
 }
 
+// CDemoRecorder::RecordCommand
+DETOUR(EngineDemoRecorder::RecordCommand, const char *cmdstring) {
+	if (proofRecorder) proofRecorder->OnRecordCommand(cmdstring);
+	return EngineDemoRecorder::RecordCommand(thisptr, cmdstring);
+}
+
+// CDemoRecorder::RecordMessages
+DETOUR(EngineDemoRecorder::RecordMessages, bf_read &data, int bits) {
+	if (proofRecorder) proofRecorder->OnRecordMessages(data, bits);
+	return EngineDemoRecorder::RecordMessages(thisptr, data, bits);
+}
+
+// CDemoRecorder::RecordPacket
+DETOUR(EngineDemoRecorder::RecordPacket) {
+	auto result = EngineDemoRecorder::RecordPacket(thisptr);
+	if (proofRecorder) proofRecorder->OnRecordPacket();
+	return result;
+}
+
+// CDemoRecorder::ResetDemoInterpolation
+DETOUR(EngineDemoRecorder::ResetDemoInterpolation) {
+	if (proofRecorder) proofRecorder->OnResetInterpolation();
+	return EngineDemoRecorder::ResetDemoInterpolation(thisptr);
+}
+
+void EngineDemoRecorder::HookProofCallbacks() {
+	if (!this->s_ClientDemoRecorder) return;
+	this->s_ClientDemoRecorder->Hook(EngineDemoRecorder::RecordCommand_Hook, EngineDemoRecorder::RecordCommand, Offsets::RecordCommand);
+	this->s_ClientDemoRecorder->Hook(EngineDemoRecorder::RecordMessages_Hook, EngineDemoRecorder::RecordMessages, Offsets::RecordMessages);
+	this->s_ClientDemoRecorder->Hook(EngineDemoRecorder::RecordPacket_Hook, EngineDemoRecorder::RecordPacket, Offsets::RecordPacket);
+	this->s_ClientDemoRecorder->Hook(EngineDemoRecorder::ResetDemoInterpolation_Hook, EngineDemoRecorder::ResetDemoInterpolation, Offsets::ResetDemoInterpolation);
+}
+
+bool EngineDemoRecorder::WantsSarData() {
+	return this->isRecordingDemo || (proofRecorder && proofRecorder->WantsSarData());
+}
+
 DETOUR_COMMAND(EngineDemoRecorder::stop) {
+	if (sar_proof_replace_demos.GetBool() && proofRecorder && proofRecorder->IsRecording()) {
+		proofRecorder->Stop("stopped");
+		return;
+	}
 	engine->demorecorder->requestedStop = true;
 	EngineDemoRecorder::stop_callback(args);
 	engine->demorecorder->requestedStop = false;
@@ -322,6 +377,17 @@ Variable sar_record_prefix("sar_record_prefix", "", "A string to prepend to reco
 Variable sar_record_mkdir("sar_record_mkdir", "1", "Automatically create directories for demos if necessary.\n");
 
 DETOUR_COMMAND(EngineDemoRecorder::record) {
+	if (sar_proof_replace_demos.GetBool() && proofRecorder && proofRecorder->available && args.ArgC() >= 2) {
+		std::string name = args[1];
+		if (sar_record_prefix.GetString()[0]) {
+			time_t t = time(nullptr);
+			char buf[MAX_PATH + 1];
+			if (strftime(buf, sizeof buf, sar_record_prefix.GetString(), localtime(&t))) name = buf + name;
+		}
+		std::string error;
+		if (!proofRecorder->Start(name, error)) console->Print("record: %s\n", error.c_str());
+		return;
+	}
 	CCommand newArgs = args;
 	bool prefixed = false;
 	bool suppress = false;
@@ -461,14 +527,16 @@ void EngineDemoRecorder::RecordData(const void *data, unsigned long length) {
 	// custom data, and stops us from doing weird things in co-op demos
 	// with menus.
 
-	if (!this->customDataReady) return;
-	if (!EngineDemoRecorder::RecordCustomData) return;
+	bool toProof = proofRecorder && proofRecorder->WantsSarData();
+	bool toDemo = this->customDataReady && EngineDemoRecorder::RecordCustomData;
+	if (!toProof && !toDemo) return;
 
 	// once again, what the fuck c++, i just want a vla
 	char *buf = (char *)malloc(length + 8);
 	memcpy(buf, engine->demorecorder->coopRadialMenuLastPos, 8);  // Actual cursor x and y pos
 	memcpy(buf + 8, data, length);
-	EngineDemoRecorder::RecordCustomData(this->s_ClientDemoRecorder->ThisPtr(), 0, buf, length + 8);
+	if (toProof) proofRecorder->OnCustomData(0, buf, length + 8);
+	if (toDemo) EngineDemoRecorder::RecordCustomData(this->s_ClientDemoRecorder->ThisPtr(), 0, buf, length + 8);
 	free(buf);
 }
 
@@ -506,6 +574,10 @@ ON_EVENT(PRE_TICK) {
 }
 
 ON_EVENT(CM_FLAGS) {
+	if (event.end && engine->demorecorder->WantsSarData() && !engine->demorecorder->isRecordingDemo) {
+		char data[2] = {0x06, (char)event.slot};
+		engine->demorecorder->RecordData(data, sizeof data);
+	}
 	if (engine->demorecorder->isRecordingDemo && event.end) {
 		char data[2] = {0x06, (char)event.slot};
 		engine->demorecorder->RecordData(data, sizeof data);

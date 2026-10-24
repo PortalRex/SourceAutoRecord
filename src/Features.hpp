@@ -6,6 +6,7 @@
 #include "Features/Cvars.hpp"
 #include "Features/DataMapDumper.hpp"
 #include "Features/Demo/NetworkGhostPlayer.hpp"
+#include "Features/Demo/ProofRecorder.hpp"
 #include "Features/EntityList.hpp"
 #include "Features/FovChanger.hpp"
 #include "Features/GroundFramesCounter.hpp"

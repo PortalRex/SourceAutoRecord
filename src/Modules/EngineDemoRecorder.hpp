@@ -50,6 +50,17 @@ public:
 	// CDemoRecorder::RecordCustomData
 	DECL_DETOUR(RecordCustomData, int id, const void *data, unsigned long length);
 
+	// The net channel and the engine call these whether or not a demo is
+	// being recorded; SAR proofs record from them (hooked by HookProofCallbacks)
+	// CDemoRecorder::RecordCommand
+	DECL_DETOUR(RecordCommand, const char *cmdstring);
+	// CDemoRecorder::RecordMessages
+	DECL_DETOUR(RecordMessages, bf_read &data, int bits);
+	// CDemoRecorder::RecordPacket
+	DECL_DETOUR(RecordPacket);
+	// CDemoRecorder::ResetDemoInterpolation
+	DECL_DETOUR(ResetDemoInterpolation);
+
 	DECL_DETOUR_COMMAND(stop);
 
 	DECL_DETOUR_COMMAND(record);
@@ -59,4 +70,11 @@ public:
 	const char *Name() override { return MODULE("engine"); }
 	void RecordData(const void *data, unsigned long length);
 	void Stop();
+	void HookProofCallbacks();
+	// SAR's own demo data is being recorded (to a demo or a SAR proof)
+	bool WantsSarData();
 };
+
+// The data SAR writes at the start of every demo segment (timestamp, file
+// checksums, speedrun ID, non-default cvars...)
+void RecordSarInitialData();

@@ -8,6 +8,7 @@
 #include "FileSystem.hpp"
 #include "InputSystem.hpp"
 #include "Features/AchievementTracker.hpp"
+#include "Features/Demo/ProofRecorder.hpp"
 #include "Features/Camera.hpp"
 #include "Features/Cvars.hpp"
 #include "Features/Demo/DemoParser.hpp"
@@ -323,6 +324,7 @@ float Engine::GetHostTime() {
 // CClientState::Disconnect
 DETOUR(Engine::Disconnect, bool bShowMainMenu) {
 	session->Ended();
+	if (proofRecorder) proofRecorder->OnDisconnect();
 	return Engine::Disconnect(thisptr, bShowMainMenu);
 }
 
@@ -726,7 +728,7 @@ void Host_AccumulateTime_Detour(float dt) {
 			*host_frametime = *host_frametime_unbounded;
 		} else {
 			if (sar_frametime_debug.GetBool()) console->Print("Host_AccumulateTime: %f (capped to %f)\n", *host_frametime_unbounded, *host_frametime);
-			if (engine->demorecorder->isRecordingDemo && g_loadstate == LOADED) {
+			if (engine->demorecorder->WantsSarData() && g_loadstate == LOADED) {
 				char data[5];
 				data[0] = 0x0F;
 				*(float *)(data + 1) = *host_frametime_unbounded;
@@ -744,7 +746,7 @@ const ConCommandBase *(*g_Cmd_ExecuteCommand)(int eTarget, const CCommand &comma
 const ConCommandBase *Cmd_ExecuteCommand_Detour(int eTarget, const CCommand &command, int nClientSlot /* = -1 */);
 static Hook Cmd_ExecuteCommand_Hook(&Cmd_ExecuteCommand_Detour);
 const ConCommandBase *Cmd_ExecuteCommand_Detour(int eTarget, const CCommand &command, int nClientSlot /* = -1 */) {
-	if (!engine->demorecorder->isRecordingDemo) {
+	if (!engine->demorecorder->WantsSarData()) {
 		auto cmd = reinterpret_cast<ConVar *>(tier1->FindCommandBase(tier1->g_pCVar->ThisPtr(), command.Arg(0)));
 		if (cmd && !(cmd->m_nFlags & FCVAR_DONTRECORD)) {
 			engine->demorecorder->queuedCommands.push_back(command.m_pArgSBuffer);

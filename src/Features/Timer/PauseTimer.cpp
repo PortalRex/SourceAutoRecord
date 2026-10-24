@@ -23,7 +23,7 @@ void PauseTimer::Increment() {
 }
 void PauseTimer::Stop() {
 	this->isActive = false;
-	if (engine->demorecorder->isRecordingDemo && session->GetTick() != 0) {  // HACKHACK: pause timer currently gets triggered on every load, before session start. we gotta make that not happen
+	if (engine->demorecorder->WantsSarData() && session->GetTick() != 0) {  // HACKHACK: pause timer currently gets triggered on every load, before session start. we gotta make that not happen
 		char data[6];
 		data[0] = 0x08;
 		*(int *)(data + 1) = this->ticks;

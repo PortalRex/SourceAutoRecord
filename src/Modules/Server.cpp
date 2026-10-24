@@ -584,7 +584,7 @@ static void __cdecl AcceptInput_Hook(void *thisptr, const char *inputName, void 
 
 	SpeedrunTimer::TestInputRules(entName, className, inputName, parameter.ToString(), activatorSlot);
 
-	if (engine->demorecorder->isRecordingDemo) {
+	if (engine->demorecorder->WantsSarData()) {
 		size_t entNameLen = strlen(entName);
 		size_t classNameLen = strlen(className);
 		size_t inputNameLen = strlen(inputName);
