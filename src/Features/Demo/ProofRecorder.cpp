@@ -406,7 +406,7 @@ bool ProofRecorder::Start(const std::string &name, std::string &error) {
 		{"sar_version", SAR_VERSION},
 		{"sar_built", SAR_BUILT},
 		{"game", sar.game->Version()},
-		{"game_dir", engine->GetGameDirectory()},
+		{"game_dir", std::filesystem::path(engine->GetGameDirectory()).filename().string()},
 		{"created_utc", date},
 		{"name", file},
 		{"player", Variable("name").GetString()},

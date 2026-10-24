@@ -50,8 +50,7 @@ namespace SarProof {
 		REC_USERCMD = 0x23,
 		REC_CONSOLECMD = 0x24,
 		REC_CUSTOMDATA = 0x25,        // demo custom data (SAR's own data uses callback 0)
-		REC_SIGNON_STATE = 0x26,
-		REC_EVENT = 0x27,             // u8 kind, string text: informational
+		REC_EVENT = 0x27,             // u8 kind, i32 clock, string text: informational
 		REC_END = 0x7F,
 	};
 

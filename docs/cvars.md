@@ -456,6 +456,15 @@
 |sar_portalgun_hud_x|5|The x position of the portalgun HUD.|
 |sar_portalgun_hud_y|5|The y position of the portalgun HUD.|
 |sar_portals_thru_portals|0|Allow firing portals through portals.|
+|sar_proof_debug_dump||Debug: file to write client entity states to after every entity update (empty = off).|
+|sar_proof_debug_loadtiming|0|Debug: print frame times for 3 seconds after each load.|
+|sar_proof_debug_timing_start|cmd|sar_proof_debug_timing_start - debug: measure frame times for the next 3 seconds.|
+|sar_proof_export|cmd|sar_proof_export \<file> [output base name] - convert a SAR proof to demo files (\<base>.dem, \<base>_2.dem, ...).|
+|sar_proof_info|cmd|sar_proof_info \<file> - verify a SAR proof and print what it contains.|
+|sar_proof_play|cmd|sar_proof_play \<file> [segment] - play a SAR proof (converted to temporary demos in \<game>/sarproof_play).|
+|sar_proof_record|cmd|sar_proof_record \<name> - record a SAR proof (.sarp) instead of a demo. It keeps recording across loads until sar_proof_stop.|
+|sar_proof_replace_demos|0|Make 'record' and 'stop' record SAR proofs (.sarp) instead of demos.|
+|sar_proof_stop|cmd|sar_proof_stop - stop recording the SAR proof.|
 |sar_pp_hud|0|Enables or disables the portals placement HUD.|
 |sar_pp_hud_font|0|Change font of portal placement hud.|
 |sar_pp_hud_opacity|100|Opacity of portal previews.|

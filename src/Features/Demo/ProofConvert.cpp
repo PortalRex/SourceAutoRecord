@@ -543,7 +543,7 @@ namespace {
 				Warn("packet at clock " + std::to_string(p.clock) + ": " + err + "; passed through unchanged");
 				BitWriter raw;
 				raw.BitsFrom(p.data, 0, p.nbits);
-				EmitPacket(cmd, tick, p.cmdinfo, p.inSeq, p.outAck, raw);
+				if (raw.bits) EmitPacket(cmd, tick, p.cmdinfo, p.inSeq, p.outAck, raw);
 				return;
 			}
 

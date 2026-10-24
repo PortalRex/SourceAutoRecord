@@ -12,6 +12,8 @@ This file contains a detailed list of all features implemented by SourceAutoReco
   - Toggleable autorecording incrementation (`sar_record_at_increment`).
   - Back-upping the demo if attempting to overwrite it (`sar_demo_overwrite_bak`).
 
+- **SAR proofs** (`.sarp`), a demo replacement without demo delay (`sar_proof_record`, `sar_proof_stop`, `sar_proof_play`, `sar_proof_export`, `sar_proof_info`, `sar_proof_replace_demos`). See [proofs.md](proofs.md).
+
 - **Config+**, an extension for config files and in-game console:
   - Adds a way to create advanced aliases (`sar_alias`) and command functions (`sar_function`) which can take parameters.
   - Allows the usage of nested quotation marks (`sar_expand`).
