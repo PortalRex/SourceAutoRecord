@@ -379,6 +379,10 @@ bool ProofRecorder::Start(const std::string &name, std::string &error) {
 		error = "already recording " + this->writer.Path();
 		return false;
 	}
+	if (engine->demoplayer->IsPlaying()) {
+		error = "can't record while a demo is playing";
+		return false;
+	}
 	std::string file = name;
 	if (!Utils::EndsWith(file, ".sarp")) file += ".sarp";
 	std::string path = std::string(engine->GetGameDirectory()) + "/" + file;
@@ -616,6 +620,8 @@ void ProofRecorder::WriteFullStringTableSync() {
 // ---- engine callbacks ----
 
 void ProofRecorder::OnSignonState(int state) {
+	// demo playback goes through signon too; the net channel records nothing then
+	if (engine->demoplayer->IsPlaying()) return;
 	this->signonState = state;
 	if (state == SS_NEW) {
 		if (this->segmentActive) this->EndSegment("level change");
