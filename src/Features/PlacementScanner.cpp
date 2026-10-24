@@ -19,6 +19,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <tuple>
 #include <vector>
 
 #define TRACE_LENGTH 2500
@@ -481,17 +482,12 @@ static bool firePortals(uintptr_t portalgun, Vector origin, Vector dir, int port
 		if (portals == 0 && orange) continue;
 		if (portals == 1 && !orange) continue;
 
-		TracePortalPlacementInfo_t info;
-		server->TraceFirePortal(portalgun, origin, dir, orange != 0, 2, info);
-
-		switch (info.ePlacementResult) {
-		case PORTAL_PLACEMENT_SUCCESS:
-		case PORTAL_PLACEMENT_USED_HELPER:
-		case PORTAL_PLACEMENT_BUMPED:
-			break;
-		default:
-			return false;
-		}
+		// the return value says whether it worked: some paths (snapping to a
+		// placement helper, coop steals) return success without setting
+		// ePlacementResult
+		TracePortalPlacementInfo_t info{};
+		info.finalPos = Vector{NAN, NAN, NAN};  // stays NaN if it isn't set
+		if (!server->TraceFirePortal(portalgun, origin, dir, orange != 0, 2, info)) return false;
 		finalPos[orange] = info.finalPos;
 	}
 	return true;
@@ -862,6 +858,7 @@ enum LiveResult : uint8_t {
 	LIVE_FAIL = 1,
 	LIVE_BUMPED = 2,
 	LIVE_SUCCESS = 3,
+	LIVE_EMPTY = 4,     // no surface there (a gap, or inside a wall); not drawn
 	LIVE_STALE = 0x80,  // mode 2: tested from an old eye position
 };
 
@@ -877,9 +874,12 @@ struct LivePlane {
 	std::set<uint64_t> doneCells;  // coarse cells fully refined
 };
 
+// surface normal (x1000), distance (x8), floor facing direction
+using LivePlaneKey = std::tuple<int, int, int, int, int>;
+
 static struct {
-	std::map<uint64_t, LivePlane> planes;
-	uint64_t current;
+	std::map<LivePlaneKey, LivePlane> planes;
+	LivePlaneKey current;
 	bool hasCurrent;
 	long long pointCount;
 	// settings the results were made with
@@ -889,6 +889,9 @@ static struct {
 	// the player's portals, which change where new ones can go
 	Vector portalPos[2];
 	bool portalActive[2];
+	// after a portal changes, wait for it to settle before testing
+	std::chrono::steady_clock::time_point settleUntil;
+	int recheck;  // next coarse cell to test again when there's time left
 	BorrowedGun gun;
 } g_live;
 
@@ -916,8 +919,34 @@ static Vector livePoint(const LivePlane &pl, float i, float j) {
 	return pl.normal * pl.dist + pl.ax1 * (i * s) + pl.ax2 * (j * s);
 }
 
-static uint8_t liveTest(uintptr_t portalgun, const LivePlane &pl, int i, int j) {
+// Whether the plane's surface is really there at a point: the grid covers
+// the whole plane, past the edges of the face you aimed at
+static bool liveSurfaceAt(const LivePlane &pl, Vector target) {
+	void *player = server->GetPlayer(GET_SLOT() + 1);
+	if (!player) return false;
+	Vector start = target + pl.normal * 2;
+	Vector delta = pl.normal * -4;
+
+	Ray_t ray;
+	ray.m_IsRay = true;
+	ray.m_IsSwept = true;
+	ray.m_Start = VectorAligned(start.x, start.y, start.z);
+	ray.m_Delta = VectorAligned(delta.x, delta.y, delta.z);
+	ray.m_StartOffset = VectorAligned();
+	ray.m_Extents = VectorAligned();
+
+	CTraceFilterSimple filter;
+	filter.SetPassEntity(player);
+	CGameTrace tr;
+	engine->TraceRay(engine->engineTrace->ThisPtr(), ray, MASK_SHOT_PORTAL, &filter, &tr);
+
+	if (tr.startsolid || tr.fraction >= 1) return false;
+	return tr.plane.normal.Dot(pl.normal) > 0.99f && fabsf(tr.endpos.Dot(pl.normal) - pl.dist) < 0.5f;
+}
+
+static uint8_t liveTest(uintptr_t portalgun, const LivePlane &pl, int i, int j, bool verbose = false) {
 	Vector target = livePoint(pl, (float)i, (float)j);
+	if (!liveSurfaceAt(pl, target)) return LIVE_EMPTY;
 	Vector origin, dir;
 	if (g_live.mode == 2) {
 		origin = g_live.eye;
@@ -933,12 +962,24 @@ static uint8_t liveTest(uintptr_t portalgun, const LivePlane &pl, int i, int j) 
 	}
 
 	Vector finalPos[2];
-	if (!firePortals(portalgun, origin, dir, g_live.portals, finalPos)) return LIVE_FAIL;
+	bool landed = firePortals(portalgun, origin, dir, g_live.portals, finalPos);
+	if (verbose) {
+		console->Print("  mode %d, portals %d, plane (%.3f %.3f %.3f) %.2f\n", g_live.mode, g_live.portals, pl.normal.x, pl.normal.y, pl.normal.z, pl.dist);
+		console->Print("  target (%.2f %.2f %.2f), origin (%.2f %.2f %.2f), dir (%.3f %.3f %.3f)\n", target.x, target.y, target.z, origin.x, origin.y, origin.z, dir.x, dir.y, dir.z);
+		for (int k = 0; k < 2; ++k) {
+			TracePortalPlacementInfo_t info{};
+			server->TraceFirePortal(portalgun, origin, dir, k != 0, 2, info);
+			console->Print("  %s: result %d, final (%.2f %.2f %.2f)\n", k ? "orange" : "blue", (int)info.ePlacementResult, info.finalPos.x, info.finalPos.y, info.finalPos.z);
+		}
+		console->Print("  firePortals %s\n", landed ? "landed" : "failed");
+	}
+	if (!landed) return LIVE_FAIL;
 
 	bool moved = false;
 	for (int k = 0; k < 2; ++k) {
 		if (g_live.portals == 0 && k) continue;
 		if (g_live.portals == 1 && !k) continue;
+		if (std::isnan(finalPos[k].x)) continue;  // not reported; assume where aimed
 		// landing on another surface (something in the way) doesn't count
 		if (fabsf(finalPos[k].Dot(pl.normal) - pl.dist) > 2) return LIVE_FAIL;
 		if ((finalPos[k] - target).Length() > g_live.tolerance) moved = true;
@@ -1002,10 +1043,8 @@ static bool liveRefine(uintptr_t portalgun, LivePlane &pl, int x0, int y0, int x
 	return true;
 }
 
-static uint64_t livePlaneKey(Vector n, float dist, int yawBucket) {
-	auto q = [](float v) { return (uint64_t)(uint16_t)(int16_t)lroundf(v * 1000); };
-	uint64_t d = (uint64_t)(uint8_t)(lroundf(dist * 4) & 0xFF);
-	return q(n.x) | q(n.y) << 16 | q(n.z) << 32 | d << 48 | (uint64_t)yawBucket << 56;
+static LivePlaneKey livePlaneKey(Vector n, float dist, int yawBucket) {
+	return {(int)lroundf(n.x * 1000), (int)lroundf(n.y * 1000), (int)lroundf(n.z * 1000), (int)lroundf(dist * 8), yawBucket};
 }
 
 // Clears the results when something they depend on changed
@@ -1037,6 +1076,7 @@ static void liveCheckSettings() {
 		Vector pos = active ? SE(portal)->abs_origin() : Vector{0, 0, 0};
 		if (active != g_live.portalActive[k] || (active && (pos - g_live.portalPos[k]).Length() > 0.01f)) {
 			liveClear();
+			g_live.settleUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
 			g_live.portalActive[k] = active;
 			g_live.portalPos[k] = pos;
 		}
@@ -1067,7 +1107,7 @@ static void liveUpdate() {
 		Math::AngleVectors(yaw, &up);
 	}
 
-	uint64_t key = livePlaneKey(n, dist, yawBucket);
+	LivePlaneKey key = livePlaneKey(n, dist, yawBucket);
 	if (g_live.mode == 2 && (!g_live.hasCurrent || key != g_live.current)) {
 		// only the surface you're aiming at is kept
 		liveClear();
@@ -1098,6 +1138,7 @@ static void liveUpdate() {
 		pl.doneCells.clear();
 	}
 
+	if (std::chrono::steady_clock::now() < g_live.settleUntil) return;
 	if (borrowPortalGun(g_live.gun)) return;
 	uintptr_t portalgun = getPortalGun(g_live.gun);
 
@@ -1145,6 +1186,23 @@ static void liveUpdate() {
 		}
 	}
 
+	// with time left, queue one cell to be tested again, so results that went
+	// stale (moving geometry, a portal still opening) get corrected
+	if (!out) {
+		int side = 2 * rc;
+		g_live.recheck %= side * side;
+		int a = g_live.recheck / side - rc, b = g_live.recheck % side - rc;
+		++g_live.recheck;
+		int x0 = (ci + a) * k, y0 = (cj + b) * k;
+		for (int j = y0; j <= y0 + k; ++j) {
+			for (int i = x0; i <= x0 + k; ++i) {
+				auto p = pl.points.find(liveKey(i, j));
+				if (p != pl.points.end() && p->second != LIVE_UNKNOWN) p->second |= LIVE_STALE;
+			}
+		}
+		pl.doneCells.erase(liveKey(x0, y0));
+	}
+
 	returnPortalGun(g_live.gun);
 }
 
@@ -1152,12 +1210,12 @@ static void liveDraw() {
 	if (g_live.planes.empty()) return;
 
 	uint8_t alpha = (uint8_t)sar_pp_live_opacity.GetInt();
-	Color colors[4];
+	Color colors[5];
 	colors[LIVE_FAIL] = Utils::GetColor(sar_pp_scan_color_fail.GetString(), false).value_or(Color(255, 0, 0));
 	colors[LIVE_BUMPED] = Utils::GetColor(sar_pp_live_color_bumped.GetString(), false).value_or(Color(230, 190, 60));
 	colors[LIVE_SUCCESS] = Utils::GetColor(sar_pp_scan_color_success.GetString(), false).value_or(Color(0, 255, 0));
-	MeshId meshes[4];
-	bool hasMesh[4] = {};
+	MeshId meshes[5];
+	bool hasMesh[5] = {};
 
 	Vector cam = camera->GetPosition(GET_SLOT());
 	float drawDist = sar_pp_live_draw_dist.GetFloat();
@@ -1168,7 +1226,7 @@ static void liveDraw() {
 
 		// one quad per run of equal results along a row
 		auto flush = [&](int i0, int i1, int j, uint8_t r) {
-			if (r == LIVE_UNKNOWN) return;
+			if (r == LIVE_UNKNOWN || r == LIVE_EMPTY) return;
 			Vector a = livePoint(pl, i0 - 0.5f, j - 0.5f);
 			if ((a - cam).Length() > drawDist) return;
 			Vector b = livePoint(pl, i1 + 0.5f, j - 0.5f);
@@ -1222,4 +1280,61 @@ ON_EVENT(RENDER) {
 
 ON_EVENT(SESSION_START) {
 	liveClear();
+}
+
+CON_COMMAND(sar_pp_live_debug, "sar_pp_live_debug - print the placement test results at your crosshair, for the live overlay's shot and a shot from your eyes.\n") {
+	if (auto why = scanningUnavailableReason()) return console->Print("Not available: %s.\n", why);
+	auto tr = camTrace();
+	if (!tr) return console->Print("Not aiming at a surface.\n");
+
+	BorrowedGun gun;
+	if (auto why = borrowPortalGun(gun)) return console->Print("Not available: %s.\n", why);
+	uintptr_t portalgun = getPortalGun(gun);
+
+	static const char *names[] = {"SUCCESS", "USED_HELPER", "BUMPED", "CANT_FIT", "CLEANSER", "OVERLAP_LINKED", "OVERLAP_PARTNER_PORTAL", "INVALID_VOLUME", "INVALID_SURFACE", "PASSTHROUGH_SURFACE"};
+	Vector n = tr->plane.normal;
+	float dist = tr->plane.dist;
+	Vector target = tr->endpos;
+	console->Print("surface normal (%.3f %.3f %.3f) dist %.2f, hit (%.2f %.2f %.2f), endpos offset %.3f\n", n.x, n.y, n.z, dist, target.x, target.y, target.z, target.Dot(n) - dist);
+
+	Vector eye;
+	QAngle eyeAng;
+	camera->GetEyePos<true>(GET_SLOT(), eye, eyeAng);
+
+	Vector straight = -n;
+	if (fabsf(n.z) > 0.999f) {
+		QAngle yaw{0, eyeAng.y, 0};
+		Vector up;
+		Math::AngleVectors(yaw, &up);
+		straight = (straight + up * TEST_FLOOR_UP_CONTRIBUTION).Normalize();
+	}
+	struct {
+		const char *name;
+		Vector origin, dir;
+	} shots[] = {
+		{"straight (mode 1)", target - straight * TEST_DIST, straight},
+		{"from eyes (mode 2)", eye, (target - eye).Normalize()},
+	};
+	for (auto &shot : shots) {
+		for (int orange = 0; orange < 2; ++orange) {
+			TracePortalPlacementInfo_t info{};
+			int ret = server->TraceFirePortal(portalgun, shot.origin, shot.dir, orange != 0, 2, info);
+			int r = (int)info.ePlacementResult;
+			console->Print("%s %s: returned %d, %s (%d), final (%.2f %.2f %.2f), off surface %.3f, from point %.2f\n",
+				shot.name, orange ? "orange" : "blue", ret, r >= 0 && r < 10 ? names[r] : "?", r,
+				info.finalPos.x, info.finalPos.y, info.finalPos.z, info.finalPos.Dot(n) - dist, (info.finalPos - target).Length());
+		}
+	}
+	static const char *liveNames[] = {"unknown", "fail (red)", "bumped (yellow)", "success (green)", "no surface (not drawn)"};
+	console->Print("sar_pp_scan_portal %d (%s)\n", sar_pp_scan_portal.GetInt(), sar_pp_scan_portal.GetInt() == 0 ? "blue" : sar_pp_scan_portal.GetInt() == 1 ? "orange" : "both");
+	if (sar_pp_live.GetBool() && g_live.hasCurrent) {
+		LivePlane &pl = g_live.planes[g_live.current];
+		int i = (int)lroundf(target.Dot(pl.ax1) / g_live.spacing);
+		int j = (int)lroundf(target.Dot(pl.ax2) / g_live.spacing);
+		auto it = pl.points.find(liveKey(i, j));
+		uint8_t cached = it == pl.points.end() ? LIVE_UNKNOWN : it->second;
+		uint8_t now = liveTest(portalgun, pl, i, j, true);
+		console->Print("overlay at (%d, %d): shown %s%s, tested now %s\n", i, j, liveNames[cached & ~LIVE_STALE], cached & LIVE_STALE ? " (stale)" : "", liveNames[now]);
+	}
+	returnPortalGun(gun);
 }
