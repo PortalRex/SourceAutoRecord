@@ -11,9 +11,9 @@
 #include "Features/EntityList.hpp"
 #include "Features/Hud/Hud.hpp"
 #include "Features/Renderer.hpp"
+#include "Utils/lodepng.hpp"
 
 #include <chrono>
-#include <cstdio>
 #include <filesystem>
 #include <optional>
 #include <vector>
@@ -21,16 +21,17 @@
 #define TRACE_LENGTH 2500
 #define TEST_DIST 2
 #define TEST_FLOOR_UP_CONTRIBUTION 0.1f
-#define MAX_IMAGE_SIZE 65535  // TGA dimensions are 16-bit
+#define MAX_IMAGE_SIZE 65535
 
 Variable sar_pp_scan_color_success("sar_pp_scan_color_success", "131 182 146", "The color rendered by pp scan when portal placement is successful.\n");
 Variable sar_pp_scan_color_fail("sar_pp_scan_color_fail", "194 69 45", "The color rendered by pp scan where portal placement fails.\n");
-Variable sar_pp_scan_savepath("sar_pp_scan_filename", "pp_scan", "The name of the TGA image to save after pp scan, without extension. Saved in the game directory; an existing file is not overwritten.\n");
+Variable sar_pp_scan_savepath("sar_pp_scan_filename", "pp_scan", "The name of the PNG image to save after pp scan, without extension. Saved in the game directory; an existing file is not overwritten.\n");
 Variable sar_pp_scan_screenshot_overlay("sar_pp_scan_screenshot_overlay", "0", "Whether to overlay pp scan screenshot on top of gameplay screenshot.\n");
 Variable sar_pp_scan_resolution("sar_pp_scan_resolution", "0.1", 0.01f, "Distance in units between the points an area scan tests.\n");
 Variable sar_pp_scan_frame_budget("sar_pp_scan_frame_budget", "8", 1, 100, "Milliseconds of scanning per frame. Higher scans faster but makes the game less responsive.\n");
 Variable sar_pp_scan_portal("sar_pp_scan_portal", "0", 0, 2, "Which portal to test: 0 = blue, 1 = orange, 2 = both (succeeds only where both can be placed).\n");
 Variable sar_pp_scan_origin("sar_pp_scan_origin", "0", 0, 1, "Where area scans fire from: 0 = straight at the wall from just in front of it, 1 = from your eye position when the scan starts.\n");
+Variable sar_pp_scan_step("sar_pp_scan_step", "4", 1, 64, "Adaptive scanning: test every Nth pixel first, then only refine the areas whose results differ. 1 = test every pixel. A spot smaller than N pixels inside an otherwise uniform area can be missed.\n");
 Variable sar_pp_scan_warn_points("sar_pp_scan_warn_points", "2000000", 0, "Ask for confirmation before area scans that test more points than this (0 = never ask).\n");
 
 enum class SetupState {
@@ -56,6 +57,10 @@ static struct {
 	Vector matchAreaCorner2;
 } g_setup;
 
+struct ScanCell {
+	int x0, y0, x1, y1;  // corner pixels, inclusive
+};
+
 static struct {
 	Vector startPoint;
 	Vector eyePosition;
@@ -63,7 +68,16 @@ static struct {
 	float resolution;
 	int maxWidth;
 	int maxHeight;
-	long long next;  // next pixel, column by column
+	// Adaptive scan: test a grid of every `step`th pixel, then split each
+	// grid cell whose corners disagree until the cells are a pixel wide;
+	// cells whose corners agree are filled in without testing.
+	int step;
+	int gridW, gridH;
+	long long gridNext;           // next grid point, column by column
+	std::vector<ScanCell> cells;  // cells left to refine
+	std::vector<uint8_t> result;  // per pixel: 0 = unknown, 1 = fail, 2 = success
+	long long resolved;           // pixels with a result
+	long long tested;             // pixels actually traced
 	Vector wallWidthAxis;
 	Vector wallHeightAxis;
 	float fovOffset;
@@ -270,35 +284,30 @@ static void restorePortalGun() {
 	SE(portalgun)->field<CBaseHandle>("m_hSecondaryPortal") = g_scan.oldSecondary;
 }
 
-// <game dir>/<name>.tga, or <name>_2.tga, <name>_3.tga... if that exists
+// <game dir>/<name>.png, or <name>_2.png, <name>_3.png... if that exists
 static std::string outputPath() {
 	std::string base = std::string(engine->GetGameDirectory()) + "/" + sar_pp_scan_savepath.GetString();
-	std::string path = base + ".tga";
+	std::string path = base + ".png";
 	for (int i = 2; std::filesystem::exists(path); ++i) {
-		path = Utils::ssprintf("%s_%d.tga", base.c_str(), i);
+		path = Utils::ssprintf("%s_%d.png", base.c_str(), i);
 	}
 	return path;
 }
 
-static bool writeTga(const std::string &path, const uint8_t *data, uint16_t w, uint16_t h) {
-	FILE *f = fopen(path.c_str(), "wb");
-	if (!f) return false;
-	uint8_t header[] = {
-		0, // ID length
-		0, // Color map type
-		2, // Image type (uncompressed true color)
-		0, 0, 0, 0, 0, // Color map info (n/a)
-		0, 0, // X origin
-		0, 0, // Y origin
-		uint8_t(w & 0xFF), uint8_t(w >> 8), // Width
-		uint8_t(h & 0xFF), uint8_t(h >> 8), // Height
-		32, // Bits per pixel
-		8, // Image descriptor: 8 alpha bits, origin bottom left
-	};
-	bool ok = fwrite(header, 1, sizeof header, f) == sizeof header;
-	ok = ok && fwrite(data, 1, (size_t)w * h * 4, f) == (size_t)w * h * 4;
-	ok = fclose(f) == 0 && ok;
-	return ok;
+// The image is BGRA with the bottom row first; PNG wants RGBA, top row first
+static bool writePng(const std::string &path, const std::vector<uint8_t> &image, int w, int h) {
+	std::vector<uint8_t> rgba(image.size());
+	for (int y = 0; y < h; ++y) {
+		const uint8_t *src = &image[(size_t)(h - 1 - y) * w * 4];
+		uint8_t *dst = &rgba[(size_t)y * w * 4];
+		for (int x = 0; x < w; ++x) {
+			dst[x * 4 + 0] = src[x * 4 + 2];
+			dst[x * 4 + 1] = src[x * 4 + 1];
+			dst[x * 4 + 2] = src[x * 4 + 0];
+			dst[x * 4 + 3] = src[x * 4 + 3];
+		}
+	}
+	return lodepng::encode(path, rgba, w, h) == 0;
 }
 
 static void loadScreenPixelsIntoImage() {
@@ -332,7 +341,9 @@ static bool prepareForScan() {
 
 	try {
 		g_scan.image.assign((size_t)g_scan.maxWidth * g_scan.maxHeight * 4, 0);
+		g_scan.result.assign((size_t)g_scan.maxWidth * g_scan.maxHeight, 0);
 	} catch (const std::bad_alloc &) {
+		std::vector<uint8_t>().swap(g_scan.image);
 		restorePortalGun();
 		console->Print("Not enough memory for a %dx%d scan.\n", g_scan.maxWidth, g_scan.maxHeight);
 		return false;
@@ -346,7 +357,13 @@ static bool prepareForScan() {
 	g_scan.failColor = Utils::GetColor(sar_pp_scan_color_fail.GetString(), false).value_or(Color(255, 0, 0, 255));
 	g_scan.portals = sar_pp_scan_portal.GetInt();
 
-	g_scan.next = 0;
+	g_scan.step = sar_pp_scan_step.GetInt();
+	g_scan.gridW = (g_scan.maxWidth + g_scan.step - 2) / g_scan.step + 1;
+	g_scan.gridH = (g_scan.maxHeight + g_scan.step - 2) / g_scan.step + 1;
+	g_scan.gridNext = 0;
+	g_scan.cells.clear();
+	g_scan.resolved = 0;
+	g_scan.tested = 0;
 	g_scan.started = std::chrono::steady_clock::now();
 	g_setup.state = SetupState::RUNNING;
 	return true;
@@ -432,9 +449,10 @@ static void endScan(bool finished, const char *why = nullptr) {
 
 	if (finished) {
 		std::string path = outputPath();
-		if (writeTga(path, g_scan.image.data(), g_scan.maxWidth, g_scan.maxHeight)) {
+		if (writePng(path, g_scan.image, g_scan.maxWidth, g_scan.maxHeight)) {
 			double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_scan.started).count();
-			console->Print("Wrote %d points to %s (%.1f s)\n", g_scan.maxWidth * g_scan.maxHeight, path.c_str(), secs);
+			long long total = (long long)g_scan.maxWidth * g_scan.maxHeight;
+			console->Print("Wrote %lld points to %s (%.1f s, traced %lld = %.1f%%)\n", total, path.c_str(), secs, g_scan.tested, 100.0 * g_scan.tested / total);
 		} else {
 			console->Print("Couldn't write %s\n", path.c_str());
 		}
@@ -443,6 +461,8 @@ static void endScan(bool finished, const char *why = nullptr) {
 	}
 
 	std::vector<uint8_t>().swap(g_scan.image);
+	std::vector<uint8_t>().swap(g_scan.result);
+	std::vector<ScanCell>().swap(g_scan.cells);
 	g_setup.state = SetupState::NONE;
 	Event::Trigger<Event::PP_SCAN_FINISH>({});
 }
@@ -515,27 +535,58 @@ static bool testPixel(uintptr_t portalgun, int x, int y) {
 	}
 }
 
-static void runScan() {
-	uintptr_t portalgun = getPortalGun();
-	if (!portalgun) {
-		endScan(false, "the portal gun is gone");
+// A pixel's result, tracing it if it isn't known yet
+static uint8_t sample(uintptr_t portalgun, int x, int y) {
+	uint8_t &r = g_scan.result[(size_t)y * g_scan.maxWidth + x];
+	if (!r) {
+		r = testPixel(portalgun, x, y) ? 2 : 1;
+		++g_scan.tested;
+		++g_scan.resolved;
+	}
+	return r;
+}
+
+static int gridCoord(int i, int max) {
+	int v = i * g_scan.step;
+	return v < max - 1 ? v : max - 1;
+}
+
+static void refineCell(uintptr_t portalgun, ScanCell c) {
+	uint8_t r = sample(portalgun, c.x0, c.y0);
+	bool same = sample(portalgun, c.x1, c.y0) == r;
+	same &= sample(portalgun, c.x0, c.y1) == r;
+	same &= sample(portalgun, c.x1, c.y1) == r;
+
+	if (same) {
+		for (int y = c.y0; y <= c.y1; ++y) {
+			uint8_t *row = &g_scan.result[(size_t)y * g_scan.maxWidth];
+			for (int x = c.x0; x <= c.x1; ++x) {
+				if (!row[x]) {
+					row[x] = r;
+					++g_scan.resolved;
+				}
+			}
+		}
 		return;
 	}
 
+	bool splitX = c.x1 - c.x0 > 1;
+	bool splitY = c.y1 - c.y0 > 1;
+	if (!splitX && !splitY) return;  // every pixel is a corner
+	int xm = splitX ? (c.x0 + c.x1) / 2 : c.x1;
+	int ym = splitY ? (c.y0 + c.y1) / 2 : c.y1;
+	g_scan.cells.push_back({c.x0, c.y0, xm, ym});
+	if (splitX) g_scan.cells.push_back({xm, c.y0, c.x1, ym});
+	if (splitY) g_scan.cells.push_back({c.x0, ym, xm, c.y1});
+	if (splitX && splitY) g_scan.cells.push_back({xm, ym, c.x1, c.y1});
+}
+
+// Blends the results over the screenshot (or the blank image)
+static void composeImage() {
 	uint8_t *image = g_scan.image.data();
-	int maxWidth = g_scan.maxWidth;
-	int maxHeight = g_scan.maxHeight;
-	long long total = (long long)maxWidth * maxHeight;
-
-	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(sar_pp_scan_frame_budget.GetInt());
-
-	while (g_scan.next < total) {
-		int width = (int)(g_scan.next / maxHeight);
-		int height = (int)(g_scan.next % maxHeight);
-		size_t pixelIndex = (size_t)height * maxWidth + width;
-		bool success = testPixel(portalgun, width, height);
-
-		Color color = success ? g_scan.successColor : g_scan.failColor;
+	size_t n = (size_t)g_scan.maxWidth * g_scan.maxHeight;
+	for (size_t pixelIndex = 0; pixelIndex < n; ++pixelIndex) {
+		Color color = g_scan.result[pixelIndex] == 2 ? g_scan.successColor : g_scan.failColor;
 
 		uint8_t baseB = image[pixelIndex * 4 + 0];
 		uint8_t baseG = image[pixelIndex * 4 + 1];
@@ -546,11 +597,44 @@ static void runScan() {
 		image[pixelIndex * 4 + 1] = 255 - (255 - baseG * baseA / 255) * (255 - color.g * color.a / 255) / 255;
 		image[pixelIndex * 4 + 2] = 255 - (255 - baseR * baseA / 255) * (255 - color.r * color.a / 255) / 255;
 		image[pixelIndex * 4 + 3] = 255 - (255 - baseA) * (255 - color.a) / 255;
+	}
+}
 
-		++g_scan.next;
-		if ((g_scan.next & 31) == 0 && std::chrono::steady_clock::now() >= deadline) return;
+static void runScan() {
+	uintptr_t portalgun = getPortalGun();
+	if (!portalgun) {
+		endScan(false, "the portal gun is gone");
+		return;
 	}
 
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(sar_pp_scan_frame_budget.GetInt());
+	auto timeUp = [&]() { return std::chrono::steady_clock::now() >= deadline; };
+	long long gridTotal = (long long)g_scan.gridW * g_scan.gridH;
+
+	while (g_scan.gridNext < gridTotal) {
+		int i = (int)(g_scan.gridNext / g_scan.gridH);
+		int j = (int)(g_scan.gridNext % g_scan.gridH);
+		sample(portalgun, gridCoord(i, g_scan.maxWidth), gridCoord(j, g_scan.maxHeight));
+		++g_scan.gridNext;
+		if (g_scan.gridNext == gridTotal && g_scan.step > 1) {
+			for (int ci = g_scan.gridW - 2; ci >= 0; --ci) {
+				for (int cj = g_scan.gridH - 2; cj >= 0; --cj) {
+					g_scan.cells.push_back({gridCoord(ci, g_scan.maxWidth), gridCoord(cj, g_scan.maxHeight), gridCoord(ci + 1, g_scan.maxWidth), gridCoord(cj + 1, g_scan.maxHeight)});
+				}
+			}
+		}
+		if ((g_scan.gridNext & 31) == 0 && timeUp()) return;
+	}
+
+	int n = 0;
+	while (!g_scan.cells.empty()) {
+		ScanCell c = g_scan.cells.back();
+		g_scan.cells.pop_back();
+		refineCell(portalgun, c);
+		if ((++n & 7) == 0 && timeUp()) return;
+	}
+
+	composeImage();
 	endScan(true);
 }
 
@@ -649,7 +733,7 @@ HUD_ELEMENT2_NO_DISABLE(pp_scan, HudType_InGame | HudType_Paused) {
 		                                         : "Placement scan is ready. Use sar_pp_scan_set to begin.";
 		break;
 	case SetupState::RUNNING:
-		status_text = Utils::ssprintf("Scanning to %s.tga... use sar_pp_scan_set to cancel.", sar_pp_scan_savepath.GetString());
+		status_text = Utils::ssprintf("Scanning to %s.png... use sar_pp_scan_set to cancel.", sar_pp_scan_savepath.GetString());
 		break;
 	default:
 		break;
@@ -659,7 +743,7 @@ HUD_ELEMENT2_NO_DISABLE(pp_scan, HudType_InGame | HudType_Paused) {
 
 	if (g_setup.state == SetupState::RUNNING) {
 		long long total = (long long)g_scan.maxWidth * g_scan.maxHeight;
-		float fraction = total > 0 ? (float)g_scan.next / (float)total : 0.0f;
+		float fraction = total > 0 ? (float)g_scan.resolved / (float)total : 0.0f;
 		double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_scan.started).count();
 		if (fraction > 0.01f) {
 			int left = (int)(elapsed / fraction - elapsed);
