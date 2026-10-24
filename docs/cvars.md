@@ -465,11 +465,16 @@
 |sar_pp_hud_y|5|y pos of portal placement hud.|
 |sar_pp_scan_color_fail|194 69 45|The color rendered by pp scan where portal placement fails.|
 |sar_pp_scan_color_success|131 182 146|The color rendered by pp scan when portal placement is successful.|
-|sar_pp_scan_filename|pp_scan|The name of the TGA image to save after pp scan, without extension.|
+|sar_pp_scan_filename|pp_scan|The name of the TGA image to save after pp scan, without extension. Saved in the game directory; an existing file is not overwritten.|
+|sar_pp_scan_frame_budget|8|Milliseconds of scanning per frame. Higher scans faster but makes the game less responsive.|
+|sar_pp_scan_origin|0|Where area scans fire from: 0 = straight at the wall from just in front of it, 1 = from your eye position when the scan starts.|
+|sar_pp_scan_portal|0|Which portal to test: 0 = blue, 1 = orange, 2 = both (succeeds only where both can be placed).|
 |sar_pp_scan_reset|cmd|sar_pp_scan_reset - reset ppscan.|
+|sar_pp_scan_resolution|0.1|Distance in units between the points an area scan tests.|
 |sar_pp_scan_screenshot|cmd|sar_pp_scan_screenshot - renders current camera perspective using ppscan rays|
 |sar_pp_scan_screenshot_overlay|0|Whether to overlay pp scan screenshot on top of gameplay screenshot.|
 |sar_pp_scan_set|cmd|sar_pp_scan_set - set the ppscan point where you're aiming.|
+|sar_pp_scan_warn_points|2000000|Ask for confirmation before area scans that test more points than this (0 = never ask).|
 |sar_prevent_ehm|0|Prevents Entity Handle Misinterpretation (EHM) from happening.|
 |sar_prevent_mat_snapshot_recompute|0|Shortens loading times by preventing state snapshot recomputation.|
 |sar_prevent_steam_logon_disconnect|0|Prevents the engine from kicking clients due to "No Steam logon".|

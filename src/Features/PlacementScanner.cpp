@@ -12,19 +12,26 @@
 #include "Features/Hud/Hud.hpp"
 #include "Features/Renderer.hpp"
 
+#include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <optional>
+#include <vector>
 
 #define TRACE_LENGTH 2500
 #define TEST_DIST 2
-#define TEST_RESOLUTION 0.1f
-#define TEST_SCAN_PROGRESS_PER_FRAME 0.001f
-#define TEST_FLOOR_UP_CONTRIBUTION 0.1f;
+#define TEST_FLOOR_UP_CONTRIBUTION 0.1f
+#define MAX_IMAGE_SIZE 65535  // TGA dimensions are 16-bit
 
 Variable sar_pp_scan_color_success("sar_pp_scan_color_success", "131 182 146", "The color rendered by pp scan when portal placement is successful.\n");
 Variable sar_pp_scan_color_fail("sar_pp_scan_color_fail", "194 69 45", "The color rendered by pp scan where portal placement fails.\n");
-Variable sar_pp_scan_savepath("sar_pp_scan_filename", "pp_scan", "The name of the TGA image to save after pp scan, without extension.\n"); 
+Variable sar_pp_scan_savepath("sar_pp_scan_filename", "pp_scan", "The name of the TGA image to save after pp scan, without extension. Saved in the game directory; an existing file is not overwritten.\n");
 Variable sar_pp_scan_screenshot_overlay("sar_pp_scan_screenshot_overlay", "0", "Whether to overlay pp scan screenshot on top of gameplay screenshot.\n");
+Variable sar_pp_scan_resolution("sar_pp_scan_resolution", "0.1", 0.01f, "Distance in units between the points an area scan tests.\n");
+Variable sar_pp_scan_frame_budget("sar_pp_scan_frame_budget", "8", 1, 100, "Milliseconds of scanning per frame. Higher scans faster but makes the game less responsive.\n");
+Variable sar_pp_scan_portal("sar_pp_scan_portal", "0", 0, 2, "Which portal to test: 0 = blue, 1 = orange, 2 = both (succeeds only where both can be placed).\n");
+Variable sar_pp_scan_origin("sar_pp_scan_origin", "0", 0, 1, "Where area scans fire from: 0 = straight at the wall from just in front of it, 1 = from your eye position when the scan starts.\n");
+Variable sar_pp_scan_warn_points("sar_pp_scan_warn_points", "2000000", 0, "Ask for confirmation before area scans that test more points than this (0 = never ask).\n");
 
 enum class SetupState {
 	NONE,
@@ -40,6 +47,7 @@ enum class SetupState {
 static struct {
 	SetupState state;
 	bool isPerspective;
+	bool confirmedLargeScan;
 	cplane_t wallPlane;
 	Vector scanUpDirection;
 	Vector scanAreaCorner1;
@@ -50,15 +58,25 @@ static struct {
 
 static struct {
 	Vector startPoint;
+	Vector eyePosition;
+	bool fromEye;
+	float resolution;
 	int maxWidth;
 	int maxHeight;
-	int widthProgress;
+	long long next;  // next pixel, column by column
 	Vector wallWidthAxis;
 	Vector wallHeightAxis;
 	float fovOffset;
 	Color successColor;
 	Color failColor;
-	uint8_t *image;
+	int portals;  // sar_pp_scan_portal when the scan started
+	std::vector<uint8_t> image;
+	// the portal gun's portal handles, restored when the scan ends
+	CBaseHandle portalgun;
+	CBaseHandle oldPrimary;
+	CBaseHandle oldSecondary;
+	bool changedPortals;
+	std::chrono::steady_clock::time_point started;
 } g_scan;
 
 static std::optional<CGameTrace> camTrace() {
@@ -152,7 +170,11 @@ static void updateScanAreaUpDirection() {
 	if (!tr) return;
 
 	if (fabsf(tr->plane.normal.z) > 0.999f) {
+		// floor or ceiling: "up" on the image is where you're facing. Use the
+		// yaw only, so looking steeply down at the floor still gives stable axes
 		QAngle angles = camera->GetAngles(GET_SLOT());
+		angles.x = 0;
+		angles.z = 0;
 		Math::AngleVectors(angles, &g_setup.scanUpDirection);
 	} else {
 		g_setup.scanUpDirection = Vector(0, 0, 1);
@@ -181,37 +203,86 @@ static bool liesInMatchArea(Vector p) {
 	return min1 <= d1 && d1 <= max1 && min2 <= d2 && d2 <= max2;
 }
 
-static uintptr_t initScan() {
-	void *player = server->GetPlayer(1);
-	if (!player) return 0;
+static uintptr_t getPortalGun() {
+	auto portalgun = (uintptr_t)entityList->LookupEntity(g_scan.portalgun);
+	return portalgun && entityList->IsPortalGun(g_scan.portalgun) ? portalgun : 0;
+}
 
-	uintptr_t portalgun = (uintptr_t)entityList->LookupEntity(SE(player)->active_weapon());
-	if (!portalgun || !entityList->IsPortalGun(SE(player)->active_weapon())) return 0;
+// Finds the scanning player's portal gun and makes sure it has both portals
+// to test with (TraceFirePortal needs them). Remembers the gun's portal
+// handles so endScan can put them back.
+static bool initScan() {
+	if (!server->TraceFirePortal || !server->FindPortal) {
+		console->Print("Placement scan is not available in this game.\n");
+		return false;
+	}
+
+	void *player = server->GetPlayer(GET_SLOT() + 1);
+	if (!player) {
+		console->Print("Cannot find your player.\n");
+		return false;
+	}
+
+	auto gunHandle = SE(player)->active_weapon();
+	uintptr_t portalgun = (uintptr_t)entityList->LookupEntity(gunHandle);
+	if (!portalgun || !entityList->IsPortalGun(gunHandle)) {
+		console->Print("Placement scan needs you to hold a portal gun.\n");
+		return false;
+	}
 
 	uint8_t linkage = SE(portalgun)->field<unsigned char>("m_iPortalLinkageGroupID");
 
-	auto m_hPrimaryPortal = SE(portalgun)->field<CBaseHandle>("m_hPrimaryPortal");
-	auto m_hSecondaryPortal = SE(portalgun)->field<CBaseHandle>("m_hSecondaryPortal");
-	auto bluePortal = (uintptr_t)entityList->LookupEntity(m_hPrimaryPortal);
-	auto orangePortal = (uintptr_t)entityList->LookupEntity(m_hSecondaryPortal);
+	auto &primary = SE(portalgun)->field<CBaseHandle>("m_hPrimaryPortal");
+	auto &secondary = SE(portalgun)->field<CBaseHandle>("m_hSecondaryPortal");
+	g_scan.portalgun = gunHandle;
+	g_scan.oldPrimary = primary;
+	g_scan.oldSecondary = secondary;
+	g_scan.changedPortals = false;
 
-	if (!bluePortal) {
-		bluePortal = server->FindPortal(linkage, false, true);
-		SE(portalgun)->field<CBaseHandle>("m_hPrimaryPortal") = ((IHandleEntity *)bluePortal)->GetRefEHandle();
+	auto bluePortal = (uintptr_t)entityList->LookupEntity(primary);
+	auto orangePortal = (uintptr_t)entityList->LookupEntity(secondary);
+
+	if (!bluePortal) bluePortal = server->FindPortal(linkage, false, true);
+	if (!orangePortal) orangePortal = server->FindPortal(linkage, true, true);
+	if (!bluePortal || !orangePortal) {
+		console->Print("Placement scan couldn't get portals for your portal gun.\n");
+		return false;
 	}
 
-	if (!orangePortal) {
-		orangePortal = server->FindPortal(linkage, true, true);
-		SE(portalgun)->field<CBaseHandle>("m_hSecondaryPortal") = ((IHandleEntity *)orangePortal)->GetRefEHandle();
+	auto blueHandle = ((IHandleEntity *)bluePortal)->GetRefEHandle();
+	auto orangeHandle = ((IHandleEntity *)orangePortal)->GetRefEHandle();
+	// CBaseHandle has no comparison operators (only a bool conversion)
+	if (primary.m_Index != blueHandle.m_Index || secondary.m_Index != orangeHandle.m_Index) {
+		primary = blueHandle;
+		secondary = orangeHandle;
+		g_scan.changedPortals = true;
 	}
 
-	return portalgun;
+	return true;
 }
 
-static void writeTga(const char *path, const uint8_t *data, uint16_t w, uint16_t h) {
-	auto filepath = fileSystem->FindFileSomewhere(path).value_or(path);
-	FILE *f = fopen(filepath.c_str(), "wb");
-	if (!f) return;
+static void restorePortalGun() {
+	if (!g_scan.changedPortals) return;
+	g_scan.changedPortals = false;
+	auto portalgun = getPortalGun();
+	if (!portalgun) return;
+	SE(portalgun)->field<CBaseHandle>("m_hPrimaryPortal") = g_scan.oldPrimary;
+	SE(portalgun)->field<CBaseHandle>("m_hSecondaryPortal") = g_scan.oldSecondary;
+}
+
+// <game dir>/<name>.tga, or <name>_2.tga, <name>_3.tga... if that exists
+static std::string outputPath() {
+	std::string base = std::string(engine->GetGameDirectory()) + "/" + sar_pp_scan_savepath.GetString();
+	std::string path = base + ".tga";
+	for (int i = 2; std::filesystem::exists(path); ++i) {
+		path = Utils::ssprintf("%s_%d.tga", base.c_str(), i);
+	}
+	return path;
+}
+
+static bool writeTga(const std::string &path, const uint8_t *data, uint16_t w, uint16_t h) {
+	FILE *f = fopen(path.c_str(), "wb");
+	if (!f) return false;
 	uint8_t header[] = {
 		0, // ID length
 		0, // Color map type
@@ -222,42 +293,63 @@ static void writeTga(const char *path, const uint8_t *data, uint16_t w, uint16_t
 		uint8_t(w & 0xFF), uint8_t(w >> 8), // Width
 		uint8_t(h & 0xFF), uint8_t(h >> 8), // Height
 		32, // Bits per pixel
-		0, // Image descriptor
+		8, // Image descriptor: 8 alpha bits, origin bottom left
 	};
-	fwrite(header, 1, sizeof header, f);
-	fwrite(data, 1, w * h * 4, f);
-	fclose(f);
+	bool ok = fwrite(header, 1, sizeof header, f) == sizeof header;
+	ok = ok && fwrite(data, 1, (size_t)w * h * 4, f) == (size_t)w * h * 4;
+	ok = fclose(f) == 0 && ok;
+	return ok;
 }
 
 static void loadScreenPixelsIntoImage() {
-	std::vector<uint8_t> buf(g_scan.maxWidth * g_scan.maxHeight * 4);
+	std::vector<uint8_t> buf((size_t)g_scan.maxWidth * g_scan.maxHeight * 4);
 	Renderer::ReadScreenPixels(0, 0, g_scan.maxWidth, g_scan.maxHeight, buf.data(), IMAGE_FORMAT_RGBA8888);
 
 	// full alpha, inverted y axis, RGBA to BGRA
 	for (int x = 0; x < g_scan.maxWidth; ++x) {
 		for (int y = 0; y < g_scan.maxHeight; ++y) {
-			size_t i = (y * g_scan.maxWidth + x) * 4;
-			size_t j = ((g_scan.maxHeight - 1 - y) * g_scan.maxWidth + x) * 4;
+			size_t i = ((size_t)y * g_scan.maxWidth + x) * 4;
+			size_t j = ((size_t)(g_scan.maxHeight - 1 - y) * g_scan.maxWidth + x) * 4;
 			g_scan.image[i + 0] = buf[j + 2];
 			g_scan.image[i + 1] = buf[j + 1];
-			g_scan.image[i + 2] = buf[j + 1];
+			g_scan.image[i + 2] = buf[j + 0];
 			g_scan.image[i + 3] = 255;
 		}
 	}
 }
 
-static void prepareForScan() {
-	g_scan.image = new uint8_t[g_scan.maxWidth * g_scan.maxHeight * 4] {};
+static bool prepareForScan() {
+	if (g_scan.maxWidth <= 0 || g_scan.maxHeight <= 0) {
+		console->Print("The scan area is empty.\n");
+		return false;
+	}
+	if (g_scan.maxWidth > MAX_IMAGE_SIZE || g_scan.maxHeight > MAX_IMAGE_SIZE) {
+		console->Print("The scan would be %dx%d pixels; the limit is %d on each side. Raise sar_pp_scan_resolution or pick a smaller area.\n", g_scan.maxWidth, g_scan.maxHeight, MAX_IMAGE_SIZE);
+		return false;
+	}
 
-	if (sar_pp_scan_screenshot_overlay.GetBool()) {
+	if (!initScan()) return false;
+
+	try {
+		g_scan.image.assign((size_t)g_scan.maxWidth * g_scan.maxHeight * 4, 0);
+	} catch (const std::bad_alloc &) {
+		restorePortalGun();
+		console->Print("Not enough memory for a %dx%d scan.\n", g_scan.maxWidth, g_scan.maxHeight);
+		return false;
+	}
+
+	if (sar_pp_scan_screenshot_overlay.GetBool() && g_setup.isPerspective) {
 		loadScreenPixelsIntoImage();
 	}
 
 	g_scan.successColor = Utils::GetColor(sar_pp_scan_color_success.GetString(), false).value_or(Color(0, 0, 255, 255));
 	g_scan.failColor = Utils::GetColor(sar_pp_scan_color_fail.GetString(), false).value_or(Color(255, 0, 0, 255));
+	g_scan.portals = sar_pp_scan_portal.GetInt();
 
-	g_scan.widthProgress = 0;
+	g_scan.next = 0;
+	g_scan.started = std::chrono::steady_clock::now();
 	g_setup.state = SetupState::RUNNING;
+	return true;
 }
 
 static void startAreaScan() {
@@ -281,11 +373,25 @@ static void startAreaScan() {
 		maxHeight = -maxHeight;
 	}
 
+	g_scan.resolution = sar_pp_scan_resolution.GetFloat();
+	double width = maxWidth / g_scan.resolution, height = maxHeight / g_scan.resolution;
+	long long points = (long long)width * (long long)height;
+
+	int warn = sar_pp_scan_warn_points.GetInt();
+	if (warn > 0 && points > warn && !g_setup.confirmedLargeScan) {
+		console->Print("This scan tests %lld points (%.0fx%.0f, %.0f MB). Use sar_pp_scan_set again to start it, or raise sar_pp_scan_resolution.\n", points, width, height, points * 4 / 1048576.0);
+		g_setup.confirmedLargeScan = true;
+		return;
+	}
+	g_setup.confirmedLargeScan = false;
+
 	g_scan.startPoint = startPoint;
-	g_scan.maxWidth = maxWidth / TEST_RESOLUTION;
-	g_scan.maxHeight = maxHeight / TEST_RESOLUTION;
+	g_scan.maxWidth = width > MAX_IMAGE_SIZE + 1 ? MAX_IMAGE_SIZE + 1 : (int)width;
+	g_scan.maxHeight = height > MAX_IMAGE_SIZE + 1 ? MAX_IMAGE_SIZE + 1 : (int)height;
 	g_scan.wallWidthAxis = wallWidthAxis;
 	g_scan.wallHeightAxis = wallHeightAxis;
+	g_scan.fromEye = sar_pp_scan_origin.GetBool();
+	g_scan.eyePosition = camera->GetPosition(GET_SLOT(), false);
 
 	prepareForScan();
 }
@@ -311,40 +417,56 @@ static void startPerspectiveScan() {
 	float standardRatio = 4.0f / 3.0f;
 	float scaledFov = atanf(tanf(fov * 0.5f) * aspectRatio / standardRatio) * 2.0f;
 	g_scan.fovOffset = 1.0f / tanf(scaledFov * 0.5f);
-	
+
 	prepareForScan();
 }
 
-static void endScan(bool success) {
-	if (success) {
-		console->Print("Success! Wrote %d points to %s.tga\n", g_scan.maxWidth * g_scan.maxHeight, sar_pp_scan_savepath.GetString());
-		std::string path = Utils::ssprintf("%s.tga", sar_pp_scan_savepath.GetString());
-		writeTga(path.c_str(), g_scan.image, g_scan.maxWidth, g_scan.maxHeight);
-	} else {
-		console->Print("Scanning failed\n");
+// Ends a running scan: saves the image when it finished, puts the portal gun
+// back as it was, frees the image and lets sar_on_pp_scan_finish run.
+static void endScan(bool finished, const char *why = nullptr) {
+	if (g_setup.state != SetupState::RUNNING) {
+		g_setup.state = SetupState::NONE;
+		return;
 	}
-	delete[] g_scan.image;
+	restorePortalGun();
+
+	if (finished) {
+		std::string path = outputPath();
+		if (writeTga(path, g_scan.image.data(), g_scan.maxWidth, g_scan.maxHeight)) {
+			double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_scan.started).count();
+			console->Print("Wrote %d points to %s (%.1f s)\n", g_scan.maxWidth * g_scan.maxHeight, path.c_str(), secs);
+		} else {
+			console->Print("Couldn't write %s\n", path.c_str());
+		}
+	} else {
+		console->Print("Placement scan stopped%s%s\n", why ? ": " : ".", why ? why : "");
+	}
+
+	std::vector<uint8_t>().swap(g_scan.image);
 	g_setup.state = SetupState::NONE;
 	Event::Trigger<Event::PP_SCAN_FINISH>({});
 }
 
 static bool testRay(uintptr_t portalgun, Vector origin, Vector dir, bool checkMatchArea) {
-	TracePortalPlacementInfo_t info;
-	server->TraceFirePortal(portalgun, origin, dir, false, 2, info);
+	for (int orange = 0; orange < 2; ++orange) {
+		if (g_scan.portals == 0 && orange) continue;
+		if (g_scan.portals == 1 && !orange) continue;
 
-	bool success;
-	switch (info.ePlacementResult) {
-	case PORTAL_PLACEMENT_SUCCESS:
-	case PORTAL_PLACEMENT_USED_HELPER:
-	case PORTAL_PLACEMENT_BUMPED:
-		success = true;
-		break;
-	default:
-		success = false;
-		break;
+		TracePortalPlacementInfo_t info;
+		server->TraceFirePortal(portalgun, origin, dir, orange != 0, 2, info);
+
+		switch (info.ePlacementResult) {
+		case PORTAL_PLACEMENT_SUCCESS:
+		case PORTAL_PLACEMENT_USED_HELPER:
+		case PORTAL_PLACEMENT_BUMPED:
+			break;
+		default:
+			return false;
+		}
+
+		if (checkMatchArea && !liesInMatchArea(info.finalPos)) return false;
 	}
-
-	return success && (!checkMatchArea || liesInMatchArea(info.finalPos));
+	return true;
 }
 
 static bool testPerspectivePixel(uintptr_t portalgun, int x, int y) {
@@ -354,31 +476,35 @@ static bool testPerspectivePixel(uintptr_t portalgun, int x, int y) {
 
 	screenPointNormalized.y *= ((float)g_scan.maxHeight / (float)g_scan.maxWidth);  // aspect ratio
 
-	Vector dir = g_setup.wallPlane.normal * g_scan.fovOffset 
-		+ g_scan.wallWidthAxis * screenPointNormalized.x 
+	Vector dir = g_setup.wallPlane.normal * g_scan.fovOffset
+		+ g_scan.wallWidthAxis * screenPointNormalized.x
 		+ g_scan.wallHeightAxis * screenPointNormalized.y;
 
 	return testRay(portalgun, g_scan.startPoint, dir.Normalize(), false);
 }
 
 static bool testAreaPixel(uintptr_t portalgun, int x, int y) {
-	float widthUnits = (g_scan.maxWidth - 1 - x) * TEST_RESOLUTION;
-	float heightUnits = (g_scan.maxHeight - 1 - y) * TEST_RESOLUTION;
+	float widthUnits = (g_scan.maxWidth - 1 - x) * g_scan.resolution;
+	float heightUnits = (g_scan.maxHeight - 1 - y) * g_scan.resolution;
+
+	Vector target = g_scan.startPoint
+		+ g_scan.wallWidthAxis * widthUnits
+		+ g_scan.wallHeightAxis * heightUnits;
+
+	if (g_scan.fromEye) {
+		Vector dir = (target - g_scan.eyePosition).Normalize();
+		return testRay(portalgun, g_scan.eyePosition, dir, true);
+	}
 
 	Vector dir = -g_setup.wallPlane.normal;
-	
+
 	// fix for floor/ceiling portals, so that the scan can actually check with correct angles
 	if (fabsf(g_setup.wallPlane.normal.z) > 0.999) {
 		dir += g_setup.scanUpDirection * TEST_FLOOR_UP_CONTRIBUTION;
 		dir = dir.Normalize();
 	}
 
-	Vector point = g_scan.startPoint 
-		+ g_scan.wallWidthAxis * widthUnits 
-		+ g_scan.wallHeightAxis * heightUnits 
-		- dir * TEST_DIST;
-
-	return testRay(portalgun, point, dir, true);
+	return testRay(portalgun, target - dir * TEST_DIST, dir, true);
 }
 
 static bool testPixel(uintptr_t portalgun, int x, int y) {
@@ -390,57 +516,55 @@ static bool testPixel(uintptr_t portalgun, int x, int y) {
 }
 
 static void runScan() {
-	uintptr_t portalgun = initScan();
+	uintptr_t portalgun = getPortalGun();
 	if (!portalgun) {
-		endScan(false);
+		endScan(false, "the portal gun is gone");
 		return;
 	}
-	
-	uint8_t *image = g_scan.image;
+
+	uint8_t *image = g_scan.image.data();
 	int maxWidth = g_scan.maxWidth;
 	int maxHeight = g_scan.maxHeight;
+	long long total = (long long)maxWidth * maxHeight;
 
-	float initialProgress = (float)g_scan.widthProgress / (float)g_scan.maxWidth;
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(sar_pp_scan_frame_budget.GetInt());
 
-	for (int width = g_scan.widthProgress; width < maxWidth; ++width) {
-		for (int height = 0; height < maxHeight; ++height) {
-			int pixelIndex = height * maxWidth + width;
-			bool success = testPixel(portalgun, width, height);
+	while (g_scan.next < total) {
+		int width = (int)(g_scan.next / maxHeight);
+		int height = (int)(g_scan.next % maxHeight);
+		size_t pixelIndex = (size_t)height * maxWidth + width;
+		bool success = testPixel(portalgun, width, height);
 
-			Color color = success ? g_scan.successColor : g_scan.failColor;
+		Color color = success ? g_scan.successColor : g_scan.failColor;
 
-			uint8_t baseB = image[pixelIndex * 4 + 0];
-			uint8_t baseG = image[pixelIndex * 4 + 1];
-			uint8_t baseR = image[pixelIndex * 4 + 2];
-			uint8_t baseA = image[pixelIndex * 4 + 3];
+		uint8_t baseB = image[pixelIndex * 4 + 0];
+		uint8_t baseG = image[pixelIndex * 4 + 1];
+		uint8_t baseR = image[pixelIndex * 4 + 2];
+		uint8_t baseA = image[pixelIndex * 4 + 3];
 
-			image[pixelIndex * 4 + 0] = 255 - (255 - baseB * baseA / 255) * (255 - color.b * color.a / 255) / 255;
-			image[pixelIndex * 4 + 1] = 255 - (255 - baseG * baseA / 255) * (255 - color.g * color.a / 255) / 255;
-			image[pixelIndex * 4 + 2] = 255 - (255 - baseR * baseA / 255) * (255 - color.r * color.a / 255) / 255;
-			image[pixelIndex * 4 + 3] = 255 - (255 - baseA) * (255 - color.a) / 255;
-		}
+		image[pixelIndex * 4 + 0] = 255 - (255 - baseB * baseA / 255) * (255 - color.b * color.a / 255) / 255;
+		image[pixelIndex * 4 + 1] = 255 - (255 - baseG * baseA / 255) * (255 - color.g * color.a / 255) / 255;
+		image[pixelIndex * 4 + 2] = 255 - (255 - baseR * baseA / 255) * (255 - color.r * color.a / 255) / 255;
+		image[pixelIndex * 4 + 3] = 255 - (255 - baseA) * (255 - color.a) / 255;
 
-		float currentProgress = (float)width / (float)maxWidth;
-		if (currentProgress < 1.0f && currentProgress > initialProgress + TEST_SCAN_PROGRESS_PER_FRAME) {
-			g_scan.widthProgress = width + 1;
-			return;
-		}
+		++g_scan.next;
+		if ((g_scan.next & 31) == 0 && std::chrono::steady_clock::now() >= deadline) return;
 	}
 
 	endScan(true);
 }
 
+static const char *scanningUnavailableReason() {
+	if (!session->isRunning) return "not in a session";
+	if (!sv_cheats.GetBool()) return "sv_cheats is disabled";
+	return nullptr;
+}
+
 static bool checkScanningAvailable() {
-	if (!session->isRunning) {
-		console->Print("Cannot start placement scan while not in a session.\n");
+	if (auto why = scanningUnavailableReason()) {
+		console->Print("Cannot start placement scan: %s.\n", why);
 		return false;
 	}
-
-	if (!sv_cheats.GetBool()) {
-		console->Print("Cannot start placement scan while sv_cheats is disabled.\n");
-		return false;
-	}
-
 	return true;
 }
 
@@ -479,8 +603,8 @@ ON_EVENT(FRAME) {
 		return;
 	}
 
-	if (!checkScanningAvailable()) {
-		g_setup.state = SetupState::NONE;
+	if (auto why = scanningUnavailableReason()) {
+		endScan(false, why);
 		return;
 	}
 
@@ -494,7 +618,7 @@ ON_EVENT(FRAME) {
 }
 
 ON_EVENT(SESSION_START) {
-	g_setup.state = SetupState::NONE;
+	endScan(false, "the level changed");
 }
 
 HUD_ELEMENT2_NO_DISABLE(pp_scan, HudType_InGame | HudType_Paused) {
@@ -509,10 +633,10 @@ HUD_ELEMENT2_NO_DISABLE(pp_scan, HudType_InGame | HudType_Paused) {
 		status_text = "Select the wall plane to scan on.";
 		break;
 	case SetupState::SET_SCAN_POINT_A:
-		status_text = "Select first corner of the scanning point.";
+		status_text = "Select first corner of the scanning area.";
 		break;
 	case SetupState::SET_SCAN_POINT_B:
-		status_text = "Select second corner of the scanning point.";
+		status_text = "Select second corner of the scanning area.";
 		break;
 	case SetupState::SET_MATCH_POINT_A:
 		status_text = "Select first corner of portal success detection area.";
@@ -521,7 +645,8 @@ HUD_ELEMENT2_NO_DISABLE(pp_scan, HudType_InGame | HudType_Paused) {
 		status_text = "Select second corner of portal success detection area.";
 		break;
 	case SetupState::READY:
-		status_text = "Placement scan is ready. Use sar_pp_scan_set to begin.";
+		status_text = g_setup.confirmedLargeScan ? "This is a large scan (see console). Use sar_pp_scan_set again to start it."
+		                                         : "Placement scan is ready. Use sar_pp_scan_set to begin.";
 		break;
 	case SetupState::RUNNING:
 		status_text = Utils::ssprintf("Scanning to %s.tga... use sar_pp_scan_set to cancel.", sar_pp_scan_savepath.GetString());
@@ -533,19 +658,27 @@ HUD_ELEMENT2_NO_DISABLE(pp_scan, HudType_InGame | HudType_Paused) {
 	surface->DrawRectAndCenterTxt(Color{0, 0, 0, 0}, 0, 0, sw, sh - 50, 6, Color{255, 255, 255}, status_text.c_str());
 
 	if (g_setup.state == SetupState::RUNNING) {
-		float percentage = 100.0f * (float)g_scan.widthProgress / (float)g_scan.maxWidth;
-		surface->DrawRectAndCenterTxt(Color{0, 0, 0, 200}, 0, 0, sw, sh + 50, 6, Color{255, 255, 255}, "%.1f%%", percentage);
+		long long total = (long long)g_scan.maxWidth * g_scan.maxHeight;
+		float fraction = total > 0 ? (float)g_scan.next / (float)total : 0.0f;
+		double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_scan.started).count();
+		if (fraction > 0.01f) {
+			int left = (int)(elapsed / fraction - elapsed);
+			surface->DrawRectAndCenterTxt(Color{0, 0, 0, 200}, 0, 0, sw, sh + 50, 6, Color{255, 255, 255}, "%.1f%% (%d:%02d left)", 100.0f * fraction, left / 60, left % 60);
+		} else {
+			surface->DrawRectAndCenterTxt(Color{0, 0, 0, 200}, 0, 0, sw, sh + 50, 6, Color{255, 255, 255}, "%.1f%%", 100.0f * fraction);
+		}
 	}
 }
 
 CON_COMMAND(sar_pp_scan_set, "sar_pp_scan_set - set the ppscan point where you're aiming.\n") {
 	if (!checkScanningAvailable()) {
-		g_setup.state = SetupState::NONE;
+		endScan(false);
 		return;
 	}
 
 	switch (g_setup.state) {
 	case SetupState::NONE:
+		g_setup.confirmedLargeScan = false;
 		g_setup.state = SetupState::SET_WALL;
 		return;
 	case SetupState::SET_WALL:
@@ -576,13 +709,13 @@ CON_COMMAND(sar_pp_scan_set, "sar_pp_scan_set - set the ppscan point where you'r
 		startAreaScan();
 		return;
 	case SetupState::RUNNING:
-		endScan(false);
+		endScan(false, "cancelled");
 		return;
 	}
 }
 
 CON_COMMAND(sar_pp_scan_reset, "sar_pp_scan_reset - reset ppscan.\n") {
-	g_setup.state = SetupState::NONE;
+	endScan(false, "reset");
 }
 
 CON_COMMAND(sar_pp_scan_screenshot, "sar_pp_scan_screenshot - renders current camera perspective using ppscan rays\n") {
