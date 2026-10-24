@@ -463,6 +463,17 @@
 |sar_pp_hud_show_orange|0|Enables or disables orange portal preview.|
 |sar_pp_hud_x|5|x pos of portal placement hud.|
 |sar_pp_hud_y|5|y pos of portal placement hud.|
+|sar_pp_live|0|Live portal placement overlay on the surface you're aiming at: 0 = off, 1 = where a portal can go (fired straight at each point; results are kept), 2 = what you can hit from your eye position (tested again when you move). Uses sar_pp_scan_portal and the sar_pp_scan_color_ colors. Requires sv_cheats.|
+|sar_pp_live_budget|2|Milliseconds per frame the live overlay spends testing.|
+|sar_pp_live_clear|cmd|sar_pp_live_clear - forget the live placement overlay's results and test again.|
+|sar_pp_live_color_bumped|230 190 60|Live overlay color where a portal lands but is moved away from the point.|
+|sar_pp_live_draw_dist|1500|Live overlay: results further than this from you aren't drawn.|
+|sar_pp_live_eye_move|1|Live overlay mode 2: how far in units your eyes can move before the results are tested again.|
+|sar_pp_live_opacity|110|Opacity of the live overlay.|
+|sar_pp_live_radius|96|How far around the crosshair the live overlay tests, in units.|
+|sar_pp_live_spacing|4|Distance in units between the points the live overlay tests.|
+|sar_pp_live_step|4|Live overlay: test every Nth point first, then refine only where results differ. 1 = test every point.|
+|sar_pp_live_tolerance|1|Live overlay: how far in units a portal can be moved from the point (bumped or snapped to a helper) and still count as landing there.|
 |sar_pp_scan_color_fail|194 69 45|The color rendered by pp scan where portal placement fails.|
 |sar_pp_scan_color_success|131 182 146|The color rendered by pp scan when portal placement is successful.|
 |sar_pp_scan_filename|pp_scan|The name of the PNG image to save after pp scan, without extension. Saved in the game directory; an existing file is not overwritten.|

@@ -14,8 +14,11 @@
 #include "Utils/lodepng.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <filesystem>
+#include <map>
 #include <optional>
+#include <set>
 #include <vector>
 
 #define TRACE_LENGTH 2500
@@ -57,6 +60,15 @@ static struct {
 	Vector matchAreaCorner2;
 } g_setup;
 
+// A portal gun set up for TraceFirePortal, which needs the gun to have both
+// portals. Remembers the gun's portal handles so they can be put back.
+struct BorrowedGun {
+	CBaseHandle portalgun;
+	CBaseHandle oldPrimary;
+	CBaseHandle oldSecondary;
+	bool changedPortals;
+};
+
 struct ScanCell {
 	int x0, y0, x1, y1;  // corner pixels, inclusive
 };
@@ -85,11 +97,7 @@ static struct {
 	Color failColor;
 	int portals;  // sar_pp_scan_portal when the scan started
 	std::vector<uint8_t> image;
-	// the portal gun's portal handles, restored when the scan ends
-	CBaseHandle portalgun;
-	CBaseHandle oldPrimary;
-	CBaseHandle oldSecondary;
-	bool changedPortals;
+	BorrowedGun gun;  // put back when the scan ends
 	std::chrono::steady_clock::time_point started;
 } g_scan;
 
@@ -217,51 +225,38 @@ static bool liesInMatchArea(Vector p) {
 	return min1 <= d1 && d1 <= max1 && min2 <= d2 && d2 <= max2;
 }
 
-static uintptr_t getPortalGun() {
-	auto portalgun = (uintptr_t)entityList->LookupEntity(g_scan.portalgun);
-	return portalgun && entityList->IsPortalGun(g_scan.portalgun) ? portalgun : 0;
+static uintptr_t getPortalGun(const BorrowedGun &gun) {
+	auto portalgun = (uintptr_t)entityList->LookupEntity(gun.portalgun);
+	return portalgun && entityList->IsPortalGun(gun.portalgun) ? portalgun : 0;
 }
 
-// Finds the scanning player's portal gun and makes sure it has both portals
-// to test with (TraceFirePortal needs them). Remembers the gun's portal
-// handles so endScan can put them back.
-static bool initScan() {
-	if (!server->TraceFirePortal || !server->FindPortal) {
-		console->Print("Placement scan is not available in this game.\n");
-		return false;
-	}
+// Finds the player's portal gun and makes sure it has both portals to test
+// with. Returns why it couldn't, or null.
+static const char *borrowPortalGun(BorrowedGun &gun) {
+	if (!server->TraceFirePortal || !server->FindPortal) return "it is not available in this game";
 
 	void *player = server->GetPlayer(GET_SLOT() + 1);
-	if (!player) {
-		console->Print("Cannot find your player.\n");
-		return false;
-	}
+	if (!player) return "cannot find your player";
 
 	auto gunHandle = SE(player)->active_weapon();
 	uintptr_t portalgun = (uintptr_t)entityList->LookupEntity(gunHandle);
-	if (!portalgun || !entityList->IsPortalGun(gunHandle)) {
-		console->Print("Placement scan needs you to hold a portal gun.\n");
-		return false;
-	}
+	if (!portalgun || !entityList->IsPortalGun(gunHandle)) return "you need to hold a portal gun";
 
 	uint8_t linkage = SE(portalgun)->field<unsigned char>("m_iPortalLinkageGroupID");
 
 	auto &primary = SE(portalgun)->field<CBaseHandle>("m_hPrimaryPortal");
 	auto &secondary = SE(portalgun)->field<CBaseHandle>("m_hSecondaryPortal");
-	g_scan.portalgun = gunHandle;
-	g_scan.oldPrimary = primary;
-	g_scan.oldSecondary = secondary;
-	g_scan.changedPortals = false;
+	gun.portalgun = gunHandle;
+	gun.oldPrimary = primary;
+	gun.oldSecondary = secondary;
+	gun.changedPortals = false;
 
 	auto bluePortal = (uintptr_t)entityList->LookupEntity(primary);
 	auto orangePortal = (uintptr_t)entityList->LookupEntity(secondary);
 
 	if (!bluePortal) bluePortal = server->FindPortal(linkage, false, true);
 	if (!orangePortal) orangePortal = server->FindPortal(linkage, true, true);
-	if (!bluePortal || !orangePortal) {
-		console->Print("Placement scan couldn't get portals for your portal gun.\n");
-		return false;
-	}
+	if (!bluePortal || !orangePortal) return "couldn't get portals for your portal gun";
 
 	auto blueHandle = ((IHandleEntity *)bluePortal)->GetRefEHandle();
 	auto orangeHandle = ((IHandleEntity *)orangePortal)->GetRefEHandle();
@@ -269,19 +264,31 @@ static bool initScan() {
 	if (primary.m_Index != blueHandle.m_Index || secondary.m_Index != orangeHandle.m_Index) {
 		primary = blueHandle;
 		secondary = orangeHandle;
-		g_scan.changedPortals = true;
+		gun.changedPortals = true;
 	}
 
+	return nullptr;
+}
+
+static void returnPortalGun(BorrowedGun &gun) {
+	if (!gun.changedPortals) return;
+	gun.changedPortals = false;
+	auto portalgun = getPortalGun(gun);
+	if (!portalgun) return;
+	SE(portalgun)->field<CBaseHandle>("m_hPrimaryPortal") = gun.oldPrimary;
+	SE(portalgun)->field<CBaseHandle>("m_hSecondaryPortal") = gun.oldSecondary;
+}
+
+static bool initScan() {
+	if (auto why = borrowPortalGun(g_scan.gun)) {
+		console->Print("Cannot start placement scan: %s.\n", why);
+		return false;
+	}
 	return true;
 }
 
 static void restorePortalGun() {
-	if (!g_scan.changedPortals) return;
-	g_scan.changedPortals = false;
-	auto portalgun = getPortalGun();
-	if (!portalgun) return;
-	SE(portalgun)->field<CBaseHandle>("m_hPrimaryPortal") = g_scan.oldPrimary;
-	SE(portalgun)->field<CBaseHandle>("m_hSecondaryPortal") = g_scan.oldSecondary;
+	returnPortalGun(g_scan.gun);
 }
 
 // <game dir>/<name>.png, or <name>_2.png, <name>_3.png... if that exists
@@ -467,10 +474,12 @@ static void endScan(bool finished, const char *why = nullptr) {
 	Event::Trigger<Event::PP_SCAN_FINISH>({});
 }
 
-static bool testRay(uintptr_t portalgun, Vector origin, Vector dir, bool checkMatchArea) {
+// Fires the portals selected by `portals` (sar_pp_scan_portal) and stores
+// where each one ends up (finalPos[0] blue, [1] orange). False if any fails.
+static bool firePortals(uintptr_t portalgun, Vector origin, Vector dir, int portals, Vector finalPos[2]) {
 	for (int orange = 0; orange < 2; ++orange) {
-		if (g_scan.portals == 0 && orange) continue;
-		if (g_scan.portals == 1 && !orange) continue;
+		if (portals == 0 && orange) continue;
+		if (portals == 1 && !orange) continue;
 
 		TracePortalPlacementInfo_t info;
 		server->TraceFirePortal(portalgun, origin, dir, orange != 0, 2, info);
@@ -483,9 +492,17 @@ static bool testRay(uintptr_t portalgun, Vector origin, Vector dir, bool checkMa
 		default:
 			return false;
 		}
-
-		if (checkMatchArea && !liesInMatchArea(info.finalPos)) return false;
+		finalPos[orange] = info.finalPos;
 	}
+	return true;
+}
+
+static bool testRay(uintptr_t portalgun, Vector origin, Vector dir, bool checkMatchArea) {
+	Vector finalPos[2];
+	if (!firePortals(portalgun, origin, dir, g_scan.portals, finalPos)) return false;
+	if (!checkMatchArea) return true;
+	if (g_scan.portals != 1 && !liesInMatchArea(finalPos[0])) return false;
+	if (g_scan.portals != 0 && !liesInMatchArea(finalPos[1])) return false;
 	return true;
 }
 
@@ -601,7 +618,7 @@ static void composeImage() {
 }
 
 static void runScan() {
-	uintptr_t portalgun = getPortalGun();
+	uintptr_t portalgun = getPortalGun(g_scan.gun);
 	if (!portalgun) {
 		endScan(false, "the portal gun is gone");
 		return;
@@ -813,4 +830,396 @@ CON_COMMAND(sar_pp_scan_screenshot, "sar_pp_scan_screenshot - renders current ca
 	}
 
 	startPerspectiveScan();
+}
+
+// Live placement overlay (sar_pp_live): paints the surface you're aiming at
+// with where portals can go, testing a grid of points around the crosshair
+// within a time budget each frame. Like the adaptive scan, it tests every
+// `step`th point first and only refines the cells whose corners disagree.
+//
+// Mode 1 fires straight at each point (like sar_pp_scan_origin 0), so the
+// results don't depend on where you stand and are kept for every surface
+// you've looked at. Mode 2 fires from your eyes, so the results are only
+// valid for one eye position: when you move they stay on screen but are
+// tested again.
+
+Variable sar_pp_live("sar_pp_live", "0", 0, 2, "Live portal placement overlay on the surface you're aiming at: 0 = off, 1 = where a portal can go (fired straight at each point; results are kept), 2 = what you can hit from your eye position (tested again when you move). Uses sar_pp_scan_portal and the sar_pp_scan_color_ colors. Requires sv_cheats.\n");
+Variable sar_pp_live_spacing("sar_pp_live_spacing", "4", 0.5f, "Distance in units between the points the live overlay tests.\n");
+Variable sar_pp_live_radius("sar_pp_live_radius", "96", 8, 1024, "How far around the crosshair the live overlay tests, in units.\n");
+Variable sar_pp_live_step("sar_pp_live_step", "4", 1, 16, "Live overlay: test every Nth point first, then refine only where results differ. 1 = test every point.\n");
+Variable sar_pp_live_budget("sar_pp_live_budget", "2", 0.1f, 50, "Milliseconds per frame the live overlay spends testing.\n");
+Variable sar_pp_live_tolerance("sar_pp_live_tolerance", "1", 0, "Live overlay: how far in units a portal can be moved from the point (bumped or snapped to a helper) and still count as landing there.\n");
+Variable sar_pp_live_color_bumped("sar_pp_live_color_bumped", "230 190 60", "Live overlay color where a portal lands but is moved away from the point.\n");
+Variable sar_pp_live_opacity("sar_pp_live_opacity", "110", 0, 255, "Opacity of the live overlay.\n");
+Variable sar_pp_live_draw_dist("sar_pp_live_draw_dist", "1500", 0, "Live overlay: results further than this from you aren't drawn.\n");
+Variable sar_pp_live_eye_move("sar_pp_live_eye_move", "1", 0, "Live overlay mode 2: how far in units your eyes can move before the results are tested again.\n");
+
+#define LIVE_FLOOR_YAW_STEP 15.0f  // floor results are kept per facing direction, in these steps
+#define LIVE_MAX_POINTS 400000     // the results are cleared beyond this
+
+enum LiveResult : uint8_t {
+	LIVE_UNKNOWN = 0,
+	LIVE_FAIL = 1,
+	LIVE_BUMPED = 2,
+	LIVE_SUCCESS = 3,
+	LIVE_STALE = 0x80,  // mode 2: tested from an old eye position
+};
+
+struct LivePlane {
+	Vector normal;
+	float dist;
+	Vector ax1, ax2;  // grid axes
+	Vector up;        // floors: the facing direction the results are for
+	bool floor;
+	// grid point (i, j) is at normal*dist + ax1*i*spacing + ax2*j*spacing,
+	// keyed so the map is ordered row by row
+	std::map<uint64_t, uint8_t> points;
+	std::set<uint64_t> doneCells;  // coarse cells fully refined
+};
+
+static struct {
+	std::map<uint64_t, LivePlane> planes;
+	uint64_t current;
+	bool hasCurrent;
+	long long pointCount;
+	// settings the results were made with
+	int mode, step, portals;
+	float spacing, tolerance;
+	Vector eye;
+	// the player's portals, which change where new ones can go
+	Vector portalPos[2];
+	bool portalActive[2];
+	BorrowedGun gun;
+} g_live;
+
+static uint64_t liveKey(int i, int j) {
+	return ((uint64_t)((uint32_t)j ^ 0x80000000u) << 32) | ((uint32_t)i ^ 0x80000000u);
+}
+
+static void liveUnkey(uint64_t key, int &i, int &j) {
+	i = (int)((uint32_t)key ^ 0x80000000u);
+	j = (int)((uint32_t)(key >> 32) ^ 0x80000000u);
+}
+
+static void liveClear() {
+	g_live.planes.clear();
+	g_live.hasCurrent = false;
+	g_live.pointCount = 0;
+}
+
+CON_COMMAND(sar_pp_live_clear, "sar_pp_live_clear - forget the live placement overlay's results and test again.\n") {
+	liveClear();
+}
+
+static Vector livePoint(const LivePlane &pl, float i, float j) {
+	float s = g_live.spacing;
+	return pl.normal * pl.dist + pl.ax1 * (i * s) + pl.ax2 * (j * s);
+}
+
+static uint8_t liveTest(uintptr_t portalgun, const LivePlane &pl, int i, int j) {
+	Vector target = livePoint(pl, (float)i, (float)j);
+	Vector origin, dir;
+	if (g_live.mode == 2) {
+		origin = g_live.eye;
+		dir = (target - origin).Normalize();
+	} else {
+		dir = -pl.normal;
+		if (pl.floor) {
+			// the portal is turned the way you're facing, as in an area scan
+			dir += pl.up * TEST_FLOOR_UP_CONTRIBUTION;
+			dir = dir.Normalize();
+		}
+		origin = target - dir * TEST_DIST;
+	}
+
+	Vector finalPos[2];
+	if (!firePortals(portalgun, origin, dir, g_live.portals, finalPos)) return LIVE_FAIL;
+
+	bool moved = false;
+	for (int k = 0; k < 2; ++k) {
+		if (g_live.portals == 0 && k) continue;
+		if (g_live.portals == 1 && !k) continue;
+		// landing on another surface (something in the way) doesn't count
+		if (fabsf(finalPos[k].Dot(pl.normal) - pl.dist) > 2) return LIVE_FAIL;
+		if ((finalPos[k] - target).Length() > g_live.tolerance) moved = true;
+	}
+	return moved ? LIVE_BUMPED : LIVE_SUCCESS;
+}
+
+// The result at a grid point, testing it if it isn't known (or is stale)
+static uint8_t liveSample(uintptr_t portalgun, LivePlane &pl, int i, int j, bool &tested) {
+	auto [it, added] = pl.points.try_emplace(liveKey(i, j), (uint8_t)LIVE_UNKNOWN);
+	if (added) ++g_live.pointCount;
+	if (it->second != LIVE_UNKNOWN && !(it->second & LIVE_STALE)) return it->second;
+	it->second = liveTest(portalgun, pl, i, j);
+	tested = true;
+	return it->second;
+}
+
+// Refines one coarse cell; false if time ran out first
+template <typename F>
+static bool liveRefine(uintptr_t portalgun, LivePlane &pl, int x0, int y0, int x1, int y1, F timeUp) {
+	struct Cell {
+		int x0, y0, x1, y1;
+	};
+	std::vector<Cell> stack{{x0, y0, x1, y1}};
+	while (!stack.empty()) {
+		Cell c = stack.back();
+		stack.pop_back();
+
+		bool tested = false;
+		uint8_t r = liveSample(portalgun, pl, c.x0, c.y0, tested);
+		bool same = liveSample(portalgun, pl, c.x1, c.y0, tested) == r;
+		same &= liveSample(portalgun, pl, c.x0, c.y1, tested) == r;
+		same &= liveSample(portalgun, pl, c.x1, c.y1, tested) == r;
+
+		if (same) {
+			for (int j = c.y0; j <= c.y1; ++j) {
+				for (int i = c.x0; i <= c.x1; ++i) {
+					auto [it, added] = pl.points.try_emplace(liveKey(i, j), r);
+					if (added) {
+						++g_live.pointCount;
+					} else if (it->second == LIVE_UNKNOWN || (it->second & LIVE_STALE)) {
+						it->second = r;
+					}
+				}
+			}
+		} else {
+			bool splitX = c.x1 - c.x0 > 1;
+			bool splitY = c.y1 - c.y0 > 1;
+			if (splitX || splitY) {
+				int xm = splitX ? (c.x0 + c.x1) / 2 : c.x1;
+				int ym = splitY ? (c.y0 + c.y1) / 2 : c.y1;
+				stack.push_back({c.x0, c.y0, xm, ym});
+				if (splitX) stack.push_back({xm, c.y0, c.x1, ym});
+				if (splitY) stack.push_back({c.x0, ym, xm, c.y1});
+				if (splitX && splitY) stack.push_back({xm, ym, c.x1, c.y1});
+			}
+		}
+
+		if (tested && timeUp()) return false;
+	}
+	return true;
+}
+
+static uint64_t livePlaneKey(Vector n, float dist, int yawBucket) {
+	auto q = [](float v) { return (uint64_t)(uint16_t)(int16_t)lroundf(v * 1000); };
+	uint64_t d = (uint64_t)(uint8_t)(lroundf(dist * 4) & 0xFF);
+	return q(n.x) | q(n.y) << 16 | q(n.z) << 32 | d << 48 | (uint64_t)yawBucket << 56;
+}
+
+// Clears the results when something they depend on changed
+static void liveCheckSettings() {
+	int mode = sar_pp_live.GetInt();
+	int step = sar_pp_live_step.GetInt();
+	int portals = sar_pp_scan_portal.GetInt();
+	float spacing = sar_pp_live_spacing.GetFloat();
+	float tolerance = sar_pp_live_tolerance.GetFloat();
+	if (mode != g_live.mode || step != g_live.step || portals != g_live.portals || spacing != g_live.spacing || tolerance != g_live.tolerance) {
+		liveClear();
+		g_live.mode = mode;
+		g_live.step = step;
+		g_live.portals = portals;
+		g_live.spacing = spacing;
+		g_live.tolerance = tolerance;
+	}
+
+	// a portal you place (or one that fizzles) changes where others can go
+	void *player = server->GetPlayer(GET_SLOT() + 1);
+	if (!player) return;
+	auto gunHandle = SE(player)->active_weapon();
+	uintptr_t portalgun = (uintptr_t)entityList->LookupEntity(gunHandle);
+	if (!portalgun || !entityList->IsPortalGun(gunHandle)) return;
+	const char *fields[2] = {"m_hPrimaryPortal", "m_hSecondaryPortal"};
+	for (int k = 0; k < 2; ++k) {
+		auto portal = (uintptr_t)entityList->LookupEntity(SE(portalgun)->field<CBaseHandle>(fields[k]));
+		bool active = portal && SE(portal)->field<bool>("m_bActivated");
+		Vector pos = active ? SE(portal)->abs_origin() : Vector{0, 0, 0};
+		if (active != g_live.portalActive[k] || (active && (pos - g_live.portalPos[k]).Length() > 0.01f)) {
+			liveClear();
+			g_live.portalActive[k] = active;
+			g_live.portalPos[k] = pos;
+		}
+	}
+}
+
+static void liveUpdate() {
+	liveCheckSettings();
+
+	auto tr = camTrace();
+	if (!tr) return;
+
+	Vector n = tr->plane.normal;
+	float dist = tr->plane.dist;
+	bool floor = fabsf(n.z) > 0.999f;
+
+	Vector eye;
+	QAngle eyeAng;
+	camera->GetEyePos<true>(GET_SLOT(), eye, eyeAng);
+
+	// mode 1 floors: results are per facing direction (the portal turns with it)
+	int yawBucket = 0;
+	Vector up{0, 0, 1};
+	if (floor && g_live.mode == 1) {
+		int buckets = (int)(360.0f / LIVE_FLOOR_YAW_STEP);
+		yawBucket = ((int)lroundf(eyeAng.y / LIVE_FLOOR_YAW_STEP) % buckets + buckets) % buckets;
+		QAngle yaw{0, yawBucket * LIVE_FLOOR_YAW_STEP, 0};
+		Math::AngleVectors(yaw, &up);
+	}
+
+	uint64_t key = livePlaneKey(n, dist, yawBucket);
+	if (g_live.mode == 2 && (!g_live.hasCurrent || key != g_live.current)) {
+		// only the surface you're aiming at is kept
+		liveClear();
+	}
+	if (g_live.pointCount > LIVE_MAX_POINTS) liveClear();
+
+	auto [it, added] = g_live.planes.try_emplace(key);
+	LivePlane &pl = it->second;
+	if (added) {
+		pl.normal = n;
+		pl.dist = dist;
+		pl.floor = floor;
+		pl.up = up;
+		// grid axes that don't depend on where you look from
+		pl.ax1 = floor ? Vector{1, 0, 0} : n.Cross(Vector{0, 0, 1});
+		pl.ax1 = pl.ax1.Normalize();
+		pl.ax2 = n.Cross(pl.ax1).Normalize();
+		g_live.eye = eye;
+	}
+	g_live.current = key;
+	g_live.hasCurrent = true;
+
+	if (g_live.mode == 2 && (eye - g_live.eye).Length() > sar_pp_live_eye_move.GetFloat()) {
+		g_live.eye = eye;
+		for (auto &p : pl.points) {
+			if (p.second != LIVE_UNKNOWN) p.second |= LIVE_STALE;
+		}
+		pl.doneCells.clear();
+	}
+
+	if (borrowPortalGun(g_live.gun)) return;
+	uintptr_t portalgun = getPortalGun(g_live.gun);
+
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds((long long)(sar_pp_live_budget.GetFloat() * 1000));
+	auto timeUp = [&]() { return std::chrono::steady_clock::now() >= deadline; };
+
+	float s = g_live.spacing;
+	int k = g_live.step;
+	int ci = (int)floorf(tr->endpos.Dot(pl.ax1) / s / k);
+	int cj = (int)floorf(tr->endpos.Dot(pl.ax2) / s / k);
+	int rc = (int)ceilf(sar_pp_live_radius.GetFloat() / (s * k));
+
+	bool out = false;
+	// coarse points, nearest the crosshair first
+	for (int r = 0; r <= rc && !out; ++r) {
+		for (int a = -r; a <= r && !out; ++a) {
+			for (int b = -r; b <= r; ++b) {
+				if (abs(a) != r && abs(b) != r) continue;
+				bool tested = false;
+				liveSample(portalgun, pl, (ci + a) * k, (cj + b) * k, tested);
+				if (tested && timeUp()) {
+					out = true;
+					break;
+				}
+			}
+		}
+	}
+	// then refine the cells between them, nearest first
+	if (k > 1) {
+		for (int r = 0; r <= rc && !out; ++r) {
+			for (int a = -r; a <= r && !out; ++a) {
+				for (int b = -r; b <= r; ++b) {
+					if (abs(a) != r && abs(b) != r) continue;
+					if (a == rc || b == rc) continue;
+					int x0 = (ci + a) * k, y0 = (cj + b) * k;
+					uint64_t cell = liveKey(x0, y0);
+					if (pl.doneCells.count(cell)) continue;
+					if (!liveRefine(portalgun, pl, x0, y0, x0 + k, y0 + k, timeUp)) {
+						out = true;
+						break;
+					}
+					pl.doneCells.insert(cell);
+				}
+			}
+		}
+	}
+
+	returnPortalGun(g_live.gun);
+}
+
+static void liveDraw() {
+	if (g_live.planes.empty()) return;
+
+	uint8_t alpha = (uint8_t)sar_pp_live_opacity.GetInt();
+	Color colors[4];
+	colors[LIVE_FAIL] = Utils::GetColor(sar_pp_scan_color_fail.GetString(), false).value_or(Color(255, 0, 0));
+	colors[LIVE_BUMPED] = Utils::GetColor(sar_pp_live_color_bumped.GetString(), false).value_or(Color(230, 190, 60));
+	colors[LIVE_SUCCESS] = Utils::GetColor(sar_pp_scan_color_success.GetString(), false).value_or(Color(0, 255, 0));
+	MeshId meshes[4];
+	bool hasMesh[4] = {};
+
+	Vector cam = camera->GetPosition(GET_SLOT());
+	float drawDist = sar_pp_live_draw_dist.GetFloat();
+
+	for (auto &[key, pl] : g_live.planes) {
+		if (fabsf(cam.Dot(pl.normal) - pl.dist) > drawDist) continue;
+		Vector zf = pl.normal * 0.05f;  // z-fighting
+
+		// one quad per run of equal results along a row
+		auto flush = [&](int i0, int i1, int j, uint8_t r) {
+			if (r == LIVE_UNKNOWN) return;
+			Vector a = livePoint(pl, i0 - 0.5f, j - 0.5f);
+			if ((a - cam).Length() > drawDist) return;
+			Vector b = livePoint(pl, i1 + 0.5f, j - 0.5f);
+			Vector c = livePoint(pl, i1 + 0.5f, j + 0.5f);
+			Vector d = livePoint(pl, i0 - 0.5f, j + 0.5f);
+			if (!hasMesh[r]) {
+				Color col = colors[r];
+				col.a = alpha;
+				meshes[r] = OverlayRender::createMesh(RenderCallback::constant(col), RenderCallback::none);
+				hasMesh[r] = true;
+			}
+			OverlayRender::addQuad(meshes[r], a + zf, b + zf, c + zf, d + zf);
+		};
+
+		bool inRun = false;
+		int runI0 = 0, runI1 = 0, runJ = 0;
+		uint8_t runR = 0;
+		for (auto &[pkey, value] : pl.points) {
+			int i, j;
+			liveUnkey(pkey, i, j);
+			uint8_t r = value & ~LIVE_STALE;
+			if (inRun && j == runJ && i == runI1 + 1 && r == runR) {
+				runI1 = i;
+				continue;
+			}
+			if (inRun) flush(runI0, runI1, runJ, runR);
+			inRun = true;
+			runI0 = runI1 = i;
+			runJ = j;
+			runR = r;
+		}
+		if (inRun) flush(runI0, runI1, runJ, runR);
+	}
+}
+
+ON_EVENT(FRAME) {
+	if (!sar_pp_live.GetBool()) {
+		if (!g_live.planes.empty()) liveClear();
+		g_live.mode = 0;
+		return;
+	}
+	// the scanner has the portal gun while it runs
+	if (scanningUnavailableReason() || g_setup.state == SetupState::RUNNING) return;
+	liveUpdate();
+}
+
+ON_EVENT(RENDER) {
+	if (!sar_pp_live.GetBool() || scanningUnavailableReason()) return;
+	liveDraw();
+}
+
+ON_EVENT(SESSION_START) {
+	liveClear();
 }
