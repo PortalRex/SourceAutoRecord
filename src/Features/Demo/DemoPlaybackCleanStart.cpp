@@ -11,6 +11,12 @@ Variable sar_demo_clean_start_tonemap("sar_demo_clean_start_tonemap", "0", 0,
 	"Setting it to 0 will attempt to skip over to target value for several ticks.\n", 0);
 
 
+Variable sar_demo_clean_transitions("sar_demo_clean_transitions", "1", 0,
+	"When a demo loads another map mid-playback (a spliced demo), starts the new map with the previous map's "
+	"auto-exposure and quickly eases to the new scene's, instead of fading in from the default, and skips "
+	"projected textures to their color.\n", 0);
+
+
 bool g_tonemapScaleDemoLookupInProgress = false;
 int g_tonemapScaleDemoLookupTick;
 bool g_tonemapScaleContinuousSearchEnabled = false;
@@ -52,14 +58,12 @@ void updateTonemapScaleDemoLookup() {
 	stopTonemapScaleDemoLookup(true);
 }
 
-void triggerTonemapScaleTweak() {
+void triggerTonemapScaleTweak(float tonemapScaleOverride, bool search) {
 	if (!client->GetCurrentTonemappingSystem || !client->ResetToneMapping) {
 		return;
 	}
 
-	float tonemapScaleOverride = sar_demo_clean_start_tonemap.GetFloat();
-
-	if (tonemapScaleOverride == 0.0f) {
+	if (search) {
 		g_tonemapScaleContinuousSearchEnabled = true;
 		auto tonemapSystem = client->GetCurrentTonemappingSystem();
 		g_tonemapScaleTweakStartTick = tonemapSystem->m_nCurrentQueryFrame;
@@ -141,21 +145,73 @@ CON_COMMAND(sar_demo_clean_start_tonemap_sample,
 }
 
 
+// exposure the previous map ended on, while a demo is playing (0: none)
+float g_transitionTonemapScale = 0.0f;
+// frames left of the fast exposure adaptation after a mid-demo map load
+int g_transitionAdaptFrames = 0;
+
+// Fraction of the way to the measured exposure covered each frame after a mid-demo map load: the new map settles
+// in about a quarter of a second, and early, noisy measurements are smoothed out instead of jumped to.
+const float TRANSITION_ADAPT_RATE = 0.2f;
+const int TRANSITION_ADAPT_FRAMES = 60;
+
+void updateTransitionAdapt() {
+	if (g_transitionAdaptFrames <= 0) return;
+	if (!client->GetCurrentTonemappingSystem || !engine->demoplayer->IsPlaying()) {
+		g_transitionAdaptFrames = 0;
+		return;
+	}
+	auto tonemapSystem = client->GetCurrentTonemappingSystem();
+	if (!tonemapSystem) {
+		g_transitionAdaptFrames = 0;
+		return;
+	}
+	tonemapSystem->m_flCurrentTonemapScale += (tonemapSystem->m_flTargetTonemapScale - tonemapSystem->m_flCurrentTonemapScale) * TRANSITION_ADAPT_RATE;
+	--g_transitionAdaptFrames;
+}
+
 ON_EVENT(FRAME) {
 	updateTonemapScaleContinuousSearch();
+	updateTransitionAdapt();
 	updateTonemapScaleDemoLookup();
 }
 
 ON_EVENT(DEMO_START) {
+	g_transitionTonemapScale = 0.0f;
+
 	if (!sar_demo_clean_start.GetBool()) {
 		return;
 	}
 
-	triggerTonemapScaleTweak();
+	float tonemapScaleOverride = sar_demo_clean_start_tonemap.GetFloat();
+	triggerTonemapScaleTweak(tonemapScaleOverride, tonemapScaleOverride == 0.0f);
 	forceProjectedTexturesTargetColor();
 }
 
 ON_EVENT(DEMO_STOP) {
+	g_transitionTonemapScale = 0.0f;
+	g_transitionAdaptFrames = 0;
 	disableTonemapScaleContinuousSearch();
 	stopTonemapScaleDemoLookup();
+}
+
+// A level change inside a demo: the client resets auto-exposure as the next map loads (normally behind the
+// loading screen), so the map would fade in from a default exposure. Start it from where the previous map was
+// and ease to the new scene's value within a few frames.
+ON_EVENT(SESSION_END) {
+	g_transitionTonemapScale = 0.0f;
+	if (!sar_demo_clean_transitions.GetBool() || !engine->demoplayer->IsPlaying() || engine->demoplayer->GetTick() <= 0) return;
+	if (!client->GetCurrentTonemappingSystem) return;
+	auto tonemapSystem = client->GetCurrentTonemappingSystem();
+	if (tonemapSystem) g_transitionTonemapScale = tonemapSystem->m_flCurrentTonemapScale;
+}
+
+ON_EVENT(SESSION_START) {
+	float tonemapScale = g_transitionTonemapScale;
+	g_transitionTonemapScale = 0.0f;
+	if (tonemapScale <= 0.0f || !sar_demo_clean_transitions.GetBool() || !engine->demoplayer->IsPlaying()) return;
+
+	triggerTonemapScaleTweak(tonemapScale, false);
+	g_transitionAdaptFrames = TRANSITION_ADAPT_FRAMES;
+	forceProjectedTexturesTargetColor();
 }
