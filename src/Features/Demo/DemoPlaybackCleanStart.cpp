@@ -3,6 +3,9 @@
 #include <Modules/Client.hpp>
 #include <Modules/Engine.hpp>
 #include <Features/Renderer.hpp>
+#include <Interface.hpp>
+#include <Utils/Memory.hpp>
+#include <Utils/SDK/UtlMemory.hpp>
 
 #include <cstring>
 #include <vector>
@@ -17,7 +20,7 @@ Variable sar_demo_clean_start_tonemap("sar_demo_clean_start_tonemap", "0", 0,
 Variable sar_demo_clean_transitions("sar_demo_clean_transitions", "1", 0,
 	"When a demo loads another map mid-playback (a spliced demo), starts the new map with the previous map's "
 	"auto-exposure and quickly eases to the new scene's, instead of fading in from the default, and skips "
-	"projected textures to their color, and keeps the viewmodel from replaying its draw animation.\n", 0);
+	"projected textures to their color, keeps the viewmodel from replaying its draw animation, and stops the portal gun's power-up sound.\n", 0);
 
 
 bool g_tonemapScaleDemoLookupInProgress = false;
@@ -203,8 +206,68 @@ void updateTransitionViewmodel() {
 	}
 }
 
+// After a mid-demo map load, playback plays the portal gun's power-up sound (Portal.PortalgunActivate, from the
+// gun being deployed again) on the player, normally under the loading screen. It isn't a sound the demo carries,
+// so it's stopped here: a one-shot on the player's static channel at the sound script's volume (0.9), within the
+// first frames after the load. Single-player only.
+const int TRANSITION_SOUND_FRAMES = 15;
+int g_transitionSoundFrames = 0;
+
+struct SndInfo_t { // IEngineSound::GetActiveSounds entry (0x34 bytes)
+	int m_nGuid;
+	int m_filenameHandle;
+	int m_nSoundSource;
+	int m_nChannel;
+	int m_nSpeakerEntity;
+	float m_flVolume;
+	float m_flLastSpatializedVolume;
+	float m_flRadius;
+	int m_nPitch;
+	void *m_pOrigin;
+	void *m_pDirection;
+	bool m_bUpdatePositions, m_bIsSentence, m_bDryMix, m_bSpeaker, m_bFromServer;
+};
+static_assert(sizeof(SndInfo_t) == 0x34, "SndInfo_t size");
+
+const int ENGINESOUND_STOPSOUNDBYGUID = 16, ENGINESOUND_GETACTIVESOUNDS = 18;
+const int CHAN_STATIC = 6;
+
+void stopTransitionStartSounds() {
+	static void *engineSound = Interface::GetPtr(MODULE("engine"), "IEngineSoundClient003");
+	if (!engineSound) return;
+
+	// a buffer the engine treats as external (grow size -1), big enough that it never needs to grow it
+	const int capacity = 1024;
+	std::vector<SndInfo_t> buffer(capacity);
+	CUtlVector<SndInfo_t> sounds;
+	sounds.m_Memory.m_pMemory = buffer.data();
+	sounds.m_Memory.m_nAllocationCount = capacity;
+	sounds.m_Memory.m_nGrowSize = -1;
+	sounds.m_Size = 0;
+	sounds.m_pElements = buffer.data();
+	Memory::VMT<void(__rescall *)(void *, CUtlVector<SndInfo_t> &)>(engineSound, ENGINESOUND_GETACTIVESOUNDS)(engineSound, sounds);
+
+	for (int i = 0; i < sounds.m_Size && i < capacity; ++i) {
+		auto &sound = buffer[i];
+		if (sound.m_nSoundSource != 1 || sound.m_nChannel != CHAN_STATIC) continue;
+		if (sound.m_flVolume < 0.85f || sound.m_flVolume > 0.95f) continue;
+		Memory::VMT<void(__rescall *)(void *, int, bool)>(engineSound, ENGINESOUND_STOPSOUNDBYGUID)(engineSound, sound.m_nGuid, false);
+	}
+}
+
+void updateTransitionSounds() {
+	if (g_transitionSoundFrames <= 0) return;
+	if (!engine->demoplayer->IsPlaying() || engine->GetMaxClients() >= 2) {
+		g_transitionSoundFrames = 0;
+		return;
+	}
+	--g_transitionSoundFrames;
+	stopTransitionStartSounds();
+}
+
 ON_EVENT(FRAME) {
 	updateTonemapScaleContinuousSearch();
+	updateTransitionSounds();
 	updateTransitionAdapt();
 	updateTransitionViewmodel();
 	updateTonemapScaleDemoLookup();
@@ -226,6 +289,7 @@ ON_EVENT(DEMO_STOP) {
 	g_transitionTonemapScale = 0.0f;
 	g_transitionAdaptFrames = 0;
 	g_transitionViewmodelFrames = 0;
+	g_transitionSoundFrames = 0;
 	disableTonemapScaleContinuousSearch();
 	stopTonemapScaleDemoLookup();
 }
@@ -250,5 +314,7 @@ ON_EVENT(SESSION_START) {
 	g_transitionAdaptFrames = TRANSITION_ADAPT_FRAMES;
 	g_transitionViewmodelFrames = TRANSITION_VIEWMODEL_FRAMES;
 	g_transitionViewmodelSequence.assign(Offsets::NUM_ENT_ENTRIES, -1);
+	g_transitionSoundFrames = TRANSITION_SOUND_FRAMES;
+	updateTransitionSounds();
 	forceProjectedTexturesTargetColor();
 }
