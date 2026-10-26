@@ -37,7 +37,9 @@ src/Version.hpp: .FORCE
 	if [ "$$RELEASE_BUILD" ]; then echo "#define SAR_VERSION \"$(VERSION)\"" >"$@"; fi
 	if [ -z "$$RELEASE_BUILD" ]; then echo "#define SAR_VERSION \"$(VERSION)-canary\"" >"$@"; fi
 	if [ -z "$$RELEASE_BUILD" ]; then echo "#define SAR_DEV_BUILD 1" >>"$@"; fi
-	# this fork's builds are for rendering: no "Activate SAR" watermark unless SAR_WATERMARK is set
-	if [ -z "$$RELEASE_BUILD" ] && [ -z "$$SAR_WATERMARK" ]; then echo "#define NO_DEV_WATERMARK 1" >>"$@"; fi
+	# this fork's builds are for rendering: no "Activate SAR" watermark and no "SAR is not up-to-date" warning
+	# (sar_update would replace the fork with official SAR) unless SAR_FORK_NAGS is set
+	if [ -z "$$RELEASE_BUILD" ] && [ -z "$$SAR_FORK_NAGS" ]; then echo "#define NO_DEV_WATERMARK 1" >>"$@"; fi
+	if [ -z "$$RELEASE_BUILD" ] && [ -z "$$SAR_FORK_NAGS" ]; then echo "#define NO_UPDATE_WARNING 1" >>"$@"; fi
 	echo "#define SAR_DEMO_SIGN_PUBKEY { $$DEMO_SIGN_PUBKEY }" >>"$@"
 	echo "#define SAR_DEMO_SIGN_PRIVKEY { $$DEMO_SIGN_PRIVKEY }" >>"$@"

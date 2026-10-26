@@ -7,6 +7,7 @@
 #include "Modules/Server.hpp"
 #include "Modules/Engine.hpp"
 #include "Variable.hpp"
+#include "Version.hpp"
 
 #include <curl/curl.h>
 
@@ -167,10 +168,12 @@ public:
 static std::thread g_worker;
 static CURL *curl;
 ON_INIT {
+#ifndef NO_UPDATE_WARNING
 	if (g_worker.joinable()) g_worker.join();
 	g_worker = std::thread(checkUpdate, curl, Channel::Release, false, [](int status) {
 		g_update_status = status;
 	});
+#endif
 }
 
 ON_EVENT(SAR_UNLOAD) {
