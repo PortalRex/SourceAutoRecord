@@ -4,6 +4,9 @@
 #include <Modules/Engine.hpp>
 #include <Features/Renderer.hpp>
 
+#include <cstring>
+#include <vector>
+
 Variable sar_demo_clean_start("sar_demo_clean_start", "0", 0,  
 	"Attempts to minimize visual interpolation of some elements (like post-processing or lighting) when demo playback begins.\n", 0);
 Variable sar_demo_clean_start_tonemap("sar_demo_clean_start_tonemap", "0", 0, 
@@ -14,7 +17,7 @@ Variable sar_demo_clean_start_tonemap("sar_demo_clean_start_tonemap", "0", 0,
 Variable sar_demo_clean_transitions("sar_demo_clean_transitions", "1", 0,
 	"When a demo loads another map mid-playback (a spliced demo), starts the new map with the previous map's "
 	"auto-exposure and quickly eases to the new scene's, instead of fading in from the default, and skips "
-	"projected textures to their color.\n", 0);
+	"projected textures to their color, and keeps the viewmodel from replaying its draw animation.\n", 0);
 
 
 bool g_tonemapScaleDemoLookupInProgress = false;
@@ -170,9 +173,40 @@ void updateTransitionAdapt() {
 	--g_transitionAdaptFrames;
 }
 
+// After a mid-demo map load the player is given their weapon again, and its viewmodel plays the draw animation:
+// the gun drops out of view and is raised, which the loading screen normally hides. The viewmodel's animation
+// cycle runs client-side, so while it still plays the sequence it started the map with, it's held at the end.
+const int TRANSITION_VIEWMODEL_FRAMES = 180;
+int g_transitionViewmodelFrames = 0;
+std::vector<int> g_transitionViewmodelSequence; // per entity: the sequence it started with, -1 unseen, -2 done
+
+void updateTransitionViewmodel() {
+	if (g_transitionViewmodelFrames <= 0) return;
+	if (!engine->demoplayer->IsPlaying()) {
+		g_transitionViewmodelFrames = 0;
+		return;
+	}
+	--g_transitionViewmodelFrames;
+	for (int i = 0; i < (int)g_transitionViewmodelSequence.size(); ++i) {
+		if (g_transitionViewmodelSequence[i] == -2) continue;
+		auto ent = client->GetEntity(i);
+		if (!ent) continue;
+		auto cc = ent->GetClientClass();
+		if (!cc || !cc->m_pNetworkName || !strstr(cc->m_pNetworkName, "ViewModel")) continue;
+		int sequence = ent->field<int>("m_nSequence");
+		if (g_transitionViewmodelSequence[i] == -1) g_transitionViewmodelSequence[i] = sequence;
+		if (sequence != g_transitionViewmodelSequence[i]) {
+			g_transitionViewmodelSequence[i] = -2;
+			continue;
+		}
+		ent->field<float>("m_flCycle") = 1.0f;
+	}
+}
+
 ON_EVENT(FRAME) {
 	updateTonemapScaleContinuousSearch();
 	updateTransitionAdapt();
+	updateTransitionViewmodel();
 	updateTonemapScaleDemoLookup();
 }
 
@@ -191,6 +225,7 @@ ON_EVENT(DEMO_START) {
 ON_EVENT(DEMO_STOP) {
 	g_transitionTonemapScale = 0.0f;
 	g_transitionAdaptFrames = 0;
+	g_transitionViewmodelFrames = 0;
 	disableTonemapScaleContinuousSearch();
 	stopTonemapScaleDemoLookup();
 }
@@ -213,5 +248,7 @@ ON_EVENT(SESSION_START) {
 
 	triggerTonemapScaleTweak(tonemapScale, false);
 	g_transitionAdaptFrames = TRANSITION_ADAPT_FRAMES;
+	g_transitionViewmodelFrames = TRANSITION_VIEWMODEL_FRAMES;
+	g_transitionViewmodelSequence.assign(Offsets::NUM_ENT_ENTRIES, -1);
 	forceProjectedTexturesTargetColor();
 }
