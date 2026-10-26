@@ -3,6 +3,7 @@
 #include <Modules/Client.hpp>
 #include <Modules/Engine.hpp>
 #include <Features/Renderer.hpp>
+#include <Features/Session.hpp>
 #include <Interface.hpp>
 #include <Utils/Memory.hpp>
 #include <Utils/SDK/UtlMemory.hpp>
@@ -209,8 +210,9 @@ void updateTransitionViewmodel() {
 // After a mid-demo map load, playback plays the portal gun's power-up sound (Portal.PortalgunActivate, from the
 // gun being deployed again) on the player, normally under the loading screen. It isn't a sound the demo carries,
 // so it's stopped here: a one-shot on the player's static channel at the sound script's volume (0.9), within the
-// first frames after the load. Single-player only.
-const int TRANSITION_SOUND_FRAMES = 15;
+// first frames after the load (watched from the end of the previous map, so it's caught on the frame it starts).
+// Single-player only.
+const int TRANSITION_SOUND_FRAMES = 15, TRANSITION_SOUND_LOAD_FRAMES = 600;
 int g_transitionSoundFrames = 0;
 
 struct SndInfo_t { // IEngineSound::GetActiveSounds entry (0x34 bytes)
@@ -251,18 +253,40 @@ void stopTransitionStartSounds() {
 		auto &sound = buffer[i];
 		if (sound.m_nSoundSource != 1 || sound.m_nChannel != CHAN_STATIC) continue;
 		if (sound.m_flVolume < 0.85f || sound.m_flVolume > 0.95f) continue;
-		Memory::VMT<void(__rescall *)(void *, int, bool)>(engineSound, ENGINESOUND_STOPSOUNDBYGUID)(engineSound, sound.m_nGuid, false);
+		Memory::VMT<void(__rescall *)(void *, int, bool)>(engineSound, ENGINESOUND_STOPSOUNDBYGUID)(engineSound, sound.m_nGuid, true);
 	}
+}
+
+// The sound starts as the map loads, and the frame that starts it is mixed before it can be stopped (about 20 ms
+// of its attack). The master volume is held at 0 from the end of the previous map until the new map's first
+// frames are past; the cut is quiet at that point anyway.
+float g_transitionSavedVolume = -1.0f;
+
+void restoreTransitionVolume() {
+	if (g_transitionSavedVolume < 0.0f) return;
+	Variable("volume").SetValue(g_transitionSavedVolume);
+	g_transitionSavedVolume = -1.0f;
+}
+
+void muteTransitionVolume() {
+	Variable volume("volume");
+	if (!volume.ThisPtr() || g_transitionSavedVolume >= 0.0f) return;
+	g_transitionSavedVolume = volume.GetFloat();
+	volume.SetValue(0.0f);
 }
 
 void updateTransitionSounds() {
 	if (g_transitionSoundFrames <= 0) return;
 	if (!engine->demoplayer->IsPlaying() || engine->GetMaxClients() >= 2) {
 		g_transitionSoundFrames = 0;
+		restoreTransitionVolume();
 		return;
 	}
 	--g_transitionSoundFrames;
 	stopTransitionStartSounds();
+	// SAR's frame event runs after the frame's audio is mixed: keep the first frame of the new map muted too, and
+	// unmute once the stopped sound is out of the mix
+	if (session->isRunning && g_transitionSoundFrames < TRANSITION_SOUND_FRAMES - 2) restoreTransitionVolume();
 }
 
 ON_EVENT(FRAME) {
@@ -290,6 +314,7 @@ ON_EVENT(DEMO_STOP) {
 	g_transitionAdaptFrames = 0;
 	g_transitionViewmodelFrames = 0;
 	g_transitionSoundFrames = 0;
+	restoreTransitionVolume();
 	disableTonemapScaleContinuousSearch();
 	stopTonemapScaleDemoLookup();
 }
@@ -303,6 +328,8 @@ ON_EVENT(SESSION_END) {
 	if (!client->GetCurrentTonemappingSystem) return;
 	auto tonemapSystem = client->GetCurrentTonemappingSystem();
 	if (tonemapSystem) g_transitionTonemapScale = tonemapSystem->m_flCurrentTonemapScale;
+	g_transitionSoundFrames = TRANSITION_SOUND_LOAD_FRAMES;
+	if (engine->GetMaxClients() < 2) muteTransitionVolume();
 }
 
 ON_EVENT(SESSION_START) {
