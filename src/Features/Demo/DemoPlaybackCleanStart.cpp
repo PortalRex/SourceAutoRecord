@@ -211,9 +211,13 @@ void updateTransitionViewmodel() {
 // gun being deployed again) on the player, normally under the loading screen. It isn't a sound the demo carries,
 // so it's stopped here: a one-shot on the player's static channel at the sound script's volume (0.9), within the
 // first frames after the load (watched from the end of the previous map, so it's caught on the frame it starts).
-// Single-player only.
-const int TRANSITION_SOUND_FRAMES = 15, TRANSITION_SOUND_LOAD_FRAMES = 600;
+// In co-op it plays on each player once at the load and again when they spawn, as the transition video ends (up to
+// ~350 ticks after the load, which is when SAR's render resumes).
+const int TRANSITION_SOUND_FRAMES = 15, TRANSITION_SOUND_LOAD_FRAMES = 600, TRANSITION_SOUND_COOP_FRAMES = 600;
+const int TRANSITION_SOUND_COOP_SPAWN_FRAMES = 60, TRANSITION_SOUND_COOP_HOLD_FRAMES = 30, TRANSITION_SOUND_COOP_RAMP_FRAMES = 30;
 int g_transitionSoundFrames = 0;
+int g_transitionSoundUnmuteFrames = 0;
+int g_transitionSoundRampFrames = 0;
 
 struct SndInfo_t { // IEngineSound::GetActiveSounds entry (0x34 bytes)
 	int m_nGuid;
@@ -234,9 +238,9 @@ static_assert(sizeof(SndInfo_t) == 0x34, "SndInfo_t size");
 const int ENGINESOUND_STOPSOUNDBYGUID = 16, ENGINESOUND_GETACTIVESOUNDS = 18;
 const int CHAN_STATIC = 6;
 
-void stopTransitionStartSounds() {
+bool stopTransitionStartSounds() {
 	static void *engineSound = Interface::GetPtr(MODULE("engine"), "IEngineSoundClient003");
-	if (!engineSound) return;
+	if (!engineSound) return false;
 
 	// a buffer the engine treats as external (grow size -1), big enough that it never needs to grow it
 	const int capacity = 1024;
@@ -249,17 +253,20 @@ void stopTransitionStartSounds() {
 	sounds.m_pElements = buffer.data();
 	Memory::VMT<void(__rescall *)(void *, CUtlVector<SndInfo_t> &)>(engineSound, ENGINESOUND_GETACTIVESOUNDS)(engineSound, sounds);
 
+	bool stopped = false;
 	for (int i = 0; i < sounds.m_Size && i < capacity; ++i) {
 		auto &sound = buffer[i];
-		if (sound.m_nSoundSource != 1 || sound.m_nChannel != CHAN_STATIC) continue;
+		if (sound.m_nSoundSource < 1 || sound.m_nSoundSource > engine->GetMaxClients() || sound.m_nChannel != CHAN_STATIC) continue;
 		if (sound.m_flVolume < 0.85f || sound.m_flVolume > 0.95f) continue;
 		Memory::VMT<void(__rescall *)(void *, int, bool)>(engineSound, ENGINESOUND_STOPSOUNDBYGUID)(engineSound, sound.m_nGuid, true);
+		stopped = true;
 	}
+	return stopped;
 }
 
-// The sound starts as the map loads, and the frame that starts it is mixed before it can be stopped (about 20 ms
-// of its attack). The master volume is held at 0 from the end of the previous map until the new map's first
-// frames are past; the cut is quiet at that point anyway.
+// The frame that starts the sound is mixed before it can be stopped (about 20 ms of its attack). The master volume
+// is held at 0 from the end of the previous map until the new map's first frames are past (co-op: until the
+// players' spawn sound is stopped); the cut is quiet at that point anyway.
 float g_transitionSavedVolume = -1.0f;
 
 void restoreTransitionVolume() {
@@ -277,16 +284,38 @@ void muteTransitionVolume() {
 
 void updateTransitionSounds() {
 	if (g_transitionSoundFrames <= 0) return;
-	if (!engine->demoplayer->IsPlaying() || engine->GetMaxClients() >= 2) {
+	if (!engine->demoplayer->IsPlaying()) {
 		g_transitionSoundFrames = 0;
 		restoreTransitionVolume();
 		return;
 	}
 	--g_transitionSoundFrames;
-	stopTransitionStartSounds();
-	// SAR's frame event runs after the frame's audio is mixed: keep the first frame of the new map muted too, and
-	// unmute once the stopped sound is out of the mix
-	if (session->isRunning && g_transitionSoundFrames < TRANSITION_SOUND_FRAMES - 2) restoreTransitionVolume();
+	bool stopped = stopTransitionStartSounds();
+	if (!session->isRunning) return;
+	bool coop = engine->GetMaxClients() >= 2;
+	if (coop && stopped && g_transitionSoundFrames < TRANSITION_SOUND_COOP_FRAMES - TRANSITION_SOUND_COOP_SPAWN_FRAMES) {
+		g_transitionSoundUnmuteFrames = TRANSITION_SOUND_COOP_HOLD_FRAMES;
+		g_transitionSoundRampFrames = 0;
+	}
+	// SAR's frame event runs after the frame's audio is mixed: keep the frame after the stop muted too, and unmute
+	// once the stopped sound is out of the mix. The co-op spawn sound leaves a reverb tail, so it's held longer
+	// (the screen is still black) and faded back in.
+	if (g_transitionSoundUnmuteFrames > 0 && --g_transitionSoundUnmuteFrames == 0) {
+		if (coop) {
+			g_transitionSoundRampFrames = TRANSITION_SOUND_COOP_RAMP_FRAMES;
+		} else {
+			restoreTransitionVolume();
+		}
+	}
+	if (g_transitionSoundRampFrames > 0) {
+		if (--g_transitionSoundRampFrames == 0) {
+			restoreTransitionVolume();
+		} else if (g_transitionSavedVolume >= 0.0f) {
+			float ramp = 1.0f - (float)g_transitionSoundRampFrames / TRANSITION_SOUND_COOP_RAMP_FRAMES;
+			Variable("volume").SetValue(g_transitionSavedVolume * ramp);
+		}
+	}
+	if (g_transitionSoundFrames == 0) restoreTransitionVolume();
 }
 
 ON_EVENT(FRAME) {
@@ -329,19 +358,29 @@ ON_EVENT(SESSION_END) {
 	auto tonemapSystem = client->GetCurrentTonemappingSystem();
 	if (tonemapSystem) g_transitionTonemapScale = tonemapSystem->m_flCurrentTonemapScale;
 	g_transitionSoundFrames = TRANSITION_SOUND_LOAD_FRAMES;
-	if (engine->GetMaxClients() < 2) muteTransitionVolume();
+	g_transitionSoundUnmuteFrames = 0;
+	g_transitionSoundRampFrames = 0;
+	muteTransitionVolume();
 }
 
 ON_EVENT(SESSION_START) {
 	float tonemapScale = g_transitionTonemapScale;
 	g_transitionTonemapScale = 0.0f;
-	if (tonemapScale <= 0.0f || !sar_demo_clean_transitions.GetBool() || !engine->demoplayer->IsPlaying()) return;
+	if (!sar_demo_clean_transitions.GetBool() || !engine->demoplayer->IsPlaying()) return;
 
+	// the power-up sound after a mid-demo load (watched since SESSION_END)
+	if (g_transitionSoundFrames > 0) {
+		bool coop = engine->GetMaxClients() >= 2;
+		g_transitionSoundFrames = coop ? TRANSITION_SOUND_COOP_FRAMES : TRANSITION_SOUND_FRAMES;
+		g_transitionSoundUnmuteFrames = coop ? 0 : 2;
+		g_transitionSoundRampFrames = 0;
+		updateTransitionSounds();
+	}
+
+	if (tonemapScale <= 0.0f) return;
 	triggerTonemapScaleTweak(tonemapScale, false);
 	g_transitionAdaptFrames = TRANSITION_ADAPT_FRAMES;
 	g_transitionViewmodelFrames = TRANSITION_VIEWMODEL_FRAMES;
 	g_transitionViewmodelSequence.assign(Offsets::NUM_ENT_ENTRIES, -1);
-	g_transitionSoundFrames = TRANSITION_SOUND_FRAMES;
-	updateTransitionSounds();
 	forceProjectedTexturesTargetColor();
 }
