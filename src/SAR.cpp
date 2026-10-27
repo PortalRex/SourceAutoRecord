@@ -230,6 +230,7 @@ void SAR::SearchPlugin() {
 void SAR::Unload() {
 	if (unloading) return;
 	unloading = true;
+	Event::stopped = true;
 
 	curl_global_cleanup();
 	if (statsCounter) {

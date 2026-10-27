@@ -30,6 +30,8 @@ public:
 };
 
 namespace Event {
+	// set when SAR starts unloading: no more handlers are called
+	inline bool stopped = false;
 	enum EventType {
 		SESSION_START,
 		SESSION_END,
@@ -118,6 +120,9 @@ namespace Event {
 	template <EventType E>
 	void Trigger(EventData<E> data) {
 		for (auto &cb : _g_eventCallbacks<E>) {
+			// a handler can unload SAR (a finished render's deferred exit runs from the scheduler's FRAME
+			// handler): the rest would run on freed features and modules
+			if (stopped) break;
 			cb.cb(data);
 		}
 	}

@@ -23,6 +23,8 @@ public:
 	Plugin *plugin;
 	Game *game;
 
+	bool IsUnloading() const { return unloading; }
+
 private:
 	std::thread findPluginThread;
 	bool unloading;

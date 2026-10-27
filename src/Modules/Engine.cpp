@@ -377,6 +377,10 @@ void Engine::GetTicks(int &host, int &server, int &client) {
 
 // CEngine::Frame
 DETOUR(Engine::Frame) {
+	// SAR::Unload (exit/quit go through SafeUnload) deletes tier1, the features and the modules, but this hook
+	// keeps running for the few ticks until plugin_unload: firing events then dereferences freed state
+	if (sar.IsUnloading()) return Engine::Frame(thisptr);
+
 	if (sar_tick_debug.GetInt() >= 2) {
 		static int lastServer, lastClient;
 		int host, server, client;
@@ -415,8 +419,12 @@ DETOUR(Engine::Frame) {
 	engine->lastTick = session->GetTick();
 
 	Renderer::Frame();
+	// a finished render's deferred exit/quit unloads SAR right inside Renderer::Frame: nothing after this may run
+	// (a render ending with "exit" crashed in the console display hook's RENDER handler, tier1 == null)
+	if (sar.IsUnloading()) return Engine::Frame(thisptr);
 	engine->demoplayer->HandlePlaybackFix();
 	Event::Trigger<Event::FRAME>({});
+	if (sar.IsUnloading()) return Engine::Frame(thisptr); // a FRAME handler (the scheduler) can run a deferred exit
 
 	if (!engine->IsForcingNoRendering() && session->isRunning) {
 		Event::Trigger<Event::RENDER>({});
