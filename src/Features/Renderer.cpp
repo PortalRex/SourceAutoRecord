@@ -83,6 +83,7 @@ static Variable sar_render_queue("sar_render_queue", "8", 2, 64, "How many finis
 static Variable sar_render_threads("sar_render_threads", "0", 0, 16, "Threads used for CPU color conversion; 0 = automatic\n");
 static Variable sar_render_nvenc_lookahead("sar_render_nvenc_lookahead", "0", 0, 32, "NVENC look-ahead depth in frames (0 = off)\n");
 static Variable sar_render_nvenc_bframes("sar_render_nvenc_bframes", "0", 0, 4, "NVENC B-frames. They make files a few percent smaller but slow renders down a lot (the GPU stalls on them)\n");
+static Variable sar_render_bitrate_mode("sar_render_bitrate_mode", "0", 0, 1, "Video rate control: 0 = constant quality (sar_render_quality), 1 = average bitrate (sar_render_vbitrate), for a predictable file size\n");
 static Variable sar_render_nvenc_multipass("sar_render_nvenc_multipass", "-1", -1, 2, "NVENC multi-pass: -1 = preset default, 0 = off, 1 = quarter resolution, 2 = full resolution\n");
 static Variable sar_render_display("sar_render_display", "0", 0, 1, "Show the frames in the game window while rendering. Off is much faster: the game window freezes until the render finishes.\n");
 static Variable sar_render_stats("sar_render_stats", "1", 0, 1, "Print timing statistics when a render finishes\n");
@@ -1388,7 +1389,10 @@ static void startRender() {
 		std::string crfStr = std::to_string(crf);
 
 		const char *name = videoCodec->name;
-		if (!strcmp(name, "libx264") || !strcmp(name, "libx265")) {
+		if (sar_render_bitrate_mode.GetBool()) {
+			// encoders follow the stream's bit_rate (sar_render_vbitrate) when no quality target is set
+			if (!strcmp(name, "libx264") || !strcmp(name, "libx265")) av_dict_set(&options, "preset", sar_render_preset.GetString(), 0);
+		} else if (!strcmp(name, "libx264") || !strcmp(name, "libx265")) {
 			av_dict_set(&options, "crf", crfStr.c_str(), 0);
 			av_dict_set(&options, "preset", sar_render_preset.GetString(), 0);
 		} else if (!strncmp(name, "libvpx", 6)) {
@@ -1454,6 +1458,7 @@ static void startRender() {
 			p.nvenc.bframes = sar_render_nvenc_bframes.GetInt();
 			p.nvenc.lookahead = sar_render_nvenc_lookahead.GetInt();
 			p.nvenc.multipass = sar_render_nvenc_multipass.GetInt();
+			p.nvenc.bitrate = sar_render_bitrate_mode.GetBool() ? (int)(videoBitrate * 1000) : 0;
 		}
 		if (!RendererGpu::Begin(p)) {
 			if (g_render.nvenc) {

@@ -771,11 +771,19 @@ namespace {
 		cfg.gopLength = p.nvenc.gop;
 		cfg.frameIntervalP = g_nv.bframes + 1;
 		cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
-		cfg.rcParams.averageBitRate = 0;
-		cfg.rcParams.maxBitRate = 0;
-		cfg.rcParams.targetQuality = (uint8_t)p.nvenc.cq;
-		cfg.rcParams.targetQualityLSB = 0;
 		cfg.rcParams.enableAQ = 1;
+		if (p.nvenc.bitrate > 0) {
+			// a file size: hold the average, let busy scenes borrow up to twice it from quiet ones
+			cfg.rcParams.averageBitRate = (uint32_t)p.nvenc.bitrate;
+			cfg.rcParams.maxBitRate = (uint32_t)p.nvenc.bitrate * 2;
+			cfg.rcParams.vbvBufferSize = (uint32_t)p.nvenc.bitrate * 2;
+			cfg.rcParams.targetQuality = 0;
+		} else {
+			cfg.rcParams.averageBitRate = 0;
+			cfg.rcParams.maxBitRate = 0;
+			cfg.rcParams.targetQuality = (uint8_t)p.nvenc.cq;
+		}
+		cfg.rcParams.targetQualityLSB = 0;
 		if (p.nvenc.multipass >= 0) {
 			cfg.rcParams.multiPass = p.nvenc.multipass == 0 ? NV_ENC_MULTI_PASS_DISABLED : p.nvenc.multipass == 1 ? NV_ENC_TWO_PASS_QUARTER_RESOLUTION : NV_ENC_TWO_PASS_FULL_RESOLUTION;
 		}

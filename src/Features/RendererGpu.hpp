@@ -37,6 +37,7 @@ namespace RendererGpu {
 			int bframes;
 			int lookahead;  // frames, 0 = off
 			int multipass;  // -1 = preset default, 0 = off, 1 = quarter res, 2 = full res
+			int bitrate;    // bit/s: average bitrate instead of the cq target, 0 = constant quality
 		} nvenc;
 	};
 
