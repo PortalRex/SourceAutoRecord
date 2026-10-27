@@ -377,6 +377,11 @@ ON_EVENT(SESSION_START) {
 		updateTransitionSounds();
 	}
 
+	// The new map's first frame is drawn before its viewmodel exists: the gun is missing (PotatOS floating
+	// where it should be) for one frame, a visible jolt at every single-player cut. That frame is left out
+	// of a render. (Co-op renders resume later, at the transition video's fade.)
+	if (engine->GetMaxClients() < 2) Renderer::SkipFrame();
+
 	if (tonemapScale <= 0.0f) return;
 	triggerTonemapScaleTweak(tonemapScale, false);
 	g_transitionAdaptFrames = TRANSITION_ADAPT_FRAMES;

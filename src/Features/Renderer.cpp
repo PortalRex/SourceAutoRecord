@@ -1553,6 +1553,14 @@ static inline short clip16(int x) {
 static void (*SND_RecordBuffer)();
 static void SND_RecordBuffer_Hook();
 static Hook g_RecordBufferHook(&SND_RecordBuffer_Hook);
+// Renderer::SkipFrame: game frames still to leave out, and the audio samples (per channel) to drop with them
+static std::atomic<int> g_skipFrames{0};
+static std::atomic<int> g_dropAudioSamples{0};
+
+void Renderer::SkipFrame() {
+	if (g_render.isRendering.load()) g_skipFrames.store(1);
+}
+
 static void SND_RecordBuffer_Hook() {
 	if (!g_render.isRendering.load()) {
 		g_RecordBufferHook.Disable();
@@ -1583,6 +1591,10 @@ static void SND_RecordBuffer_Hook() {
 	int vol = *g_snd_vol;
 
 	for (int i = 0; i < count; i += channels) {
+		if (g_dropAudioSamples.load() > 0) {
+			--g_dropAudioSamples;
+			continue;
+		}
 		for (int c = 0; c < channels; ++c) {
 			planes[c][g_render.audioFill] = clip16((src[i + c] * vol) >> 8);
 		}
@@ -1930,6 +1942,13 @@ void Renderer::Frame() {
 
 	if (g_render.isPaused.load())
 		return;
+
+	if (g_skipFrames.load() > 0) {
+		--g_skipFrames;
+		// the audio that belongs to this game frame goes too
+		g_dropAudioSamples += g_render.samplerate / (g_render.fps * std::max(1, g_render.toBlend));
+		return;
+	}
 
 	// Don't render if the console is visible
 	if (engine->ConsoleVisible()) return;
