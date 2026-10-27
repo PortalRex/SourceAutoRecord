@@ -773,9 +773,11 @@ namespace {
 		cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
 		cfg.rcParams.enableAQ = 1;
 		if (p.nvenc.bitrate > 0) {
-			// a file size: hold the average, let busy scenes borrow up to twice it from quiet ones
+			// a file size: constant bitrate (VBR's average drifted 7-19% over in tests), with a 2 s buffer so
+			// busy scenes can borrow from quiet ones
+			cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
 			cfg.rcParams.averageBitRate = (uint32_t)p.nvenc.bitrate;
-			cfg.rcParams.maxBitRate = (uint32_t)p.nvenc.bitrate * 2;
+			cfg.rcParams.maxBitRate = (uint32_t)p.nvenc.bitrate;
 			cfg.rcParams.vbvBufferSize = (uint32_t)p.nvenc.bitrate * 2;
 			cfg.rcParams.targetQuality = 0;
 		} else {
