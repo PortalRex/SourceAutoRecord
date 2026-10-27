@@ -7,8 +7,12 @@
 #include "Offsets.hpp"
 #include "SAR.hpp"
 #include "Utils.hpp"
+#include "Modules/Engine.hpp"
+
+Variable sar_demo_free_cursor("sar_demo_free_cursor", "1", "While a demo plays, don't let the game move the mouse cursor. It re-centres the cursor every frame, even in the background, which takes the mouse away from other programs during a render.\n");
 
 REDECL(InputSystem::SleepUntilInput);
+REDECL(InputSystem::MoveCursor);
 #ifdef _WIN32
 REDECL(InputSystem::GetRawMouseAccumulators);
 #endif
@@ -64,6 +68,12 @@ DETOUR(InputSystem::SleepUntilInput, int nMaxSleepTimeMS) {
 	return InputSystem::SleepUntilInput(thisptr, nMaxSleepTimeMS);
 }
 
+// The game re-centres the cursor on its window for mouse look; demo playback doesn't use the mouse.
+DETOUR_T(void, InputSystem::MoveCursor, int x, int y) {
+	if (sar_demo_free_cursor.GetBool() && engine->demoplayer && engine->demoplayer->IsPlaying()) return;
+	InputSystem::MoveCursor(thisptr, x, y);
+}
+
 #ifdef _WIN32
 // CInputSystem::GetRawMouseAccumulators
 DETOUR_T(void, InputSystem::GetRawMouseAccumulators, int &x, int &y) {
@@ -78,6 +88,7 @@ bool InputSystem::Init() {
 		this->StringToButtonCode = this->g_InputSystem->Original<_StringToButtonCode>(Offsets::StringToButtonCode);
 
 		this->g_InputSystem->Hook(InputSystem::SleepUntilInput_Hook, InputSystem::SleepUntilInput, Offsets::SleepUntilInput);
+		this->g_InputSystem->Hook(InputSystem::MoveCursor_Hook, InputSystem::MoveCursor, Offsets::SetCursorPosition);
 #ifdef _WIN32
 		this->g_InputSystem->Hook(InputSystem::GetRawMouseAccumulators_Hook, InputSystem::GetRawMouseAccumulators, Offsets::GetRawMouseAccumulators);
 #endif

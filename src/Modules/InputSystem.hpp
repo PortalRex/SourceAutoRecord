@@ -240,6 +240,9 @@ public:
 	// CInputSystem::SleepUntilInput
 	DECL_DETOUR(SleepUntilInput, int nMaxSleepTimeMS);
 
+	// CInputSystem::SetCursorPosition, as the game calls it (SAR's own SetCursorPos goes to the original)
+	DECL_DETOUR_T(void, MoveCursor, int x, int y);
+
 #ifdef _WIN32
 	// CInputSystem::GetRawMouseAccumulators
 	DECL_DETOUR_T(void, GetRawMouseAccumulators, int &x, int &y);
