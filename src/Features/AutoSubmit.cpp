@@ -24,6 +24,9 @@
 #include <string>
 
 #define API_BASE_AUTORENDER "https://autorender.portal2.sr/api"
+// The new boards while they're tested before taking over board.portal2.sr: one address for
+// both games, so Mel asks it for Mel's maps by name.
+#define PREVIEW_BOARDS "preview.portal2.sr"
 #define AUTOSUBMIT_TOAST_TAG "autosubmit"
 #define COOP_NAME_MESSAGE_TYPE "coop-name"
 #define API_KEY_FILE "autosubmit.key"
@@ -150,7 +153,25 @@ static void testApiKey() {
 		return;
 	}
 
+	// A form of its own: the one above is freed, and the handle would still post it.
+	form = curl_mime_init(g_curl);
+
+	field = curl_mime_addpart(form);
+	curl_mime_name(field, "auth_hash");
+	curl_mime_data(field, g_api_key.c_str(), CURL_ZERO_TERMINATED);
+
+	if (g_api_base == "https://" PREVIEW_BOARDS "/api-v2") {
+		field = curl_mime_addpart(form);
+		curl_mime_name(field, "game");
+		curl_mime_data(field, "mel", CURL_ZERO_TERMINATED);
+	}
+
+	curl_easy_setopt(g_curl, CURLOPT_MIMEPOST, form);
+
 	response = request(g_curl, g_api_base + "/download-maps");
+
+	curl_mime_free(form);
+
 	if (!response) {
 		THREAD_PRINT("Failed to download maps!\n");
 		return;
@@ -438,6 +459,7 @@ void AutoSubmit::LoadApiKey(bool output_nonexist) {
 		while (!f.eof()) {
 			std::getline(f, base) && std::getline(f, key);
 			if (sar.game->Is(SourceGame_Portal2) && base == "board.portal2.sr") break;
+			if (base == PREVIEW_BOARDS) break;
 			if (sar.game->Is(SourceGame_PortalStoriesMel) && base == "mel.portal2.sr") break;
 			if (sar.game->Is(SourceGame_PortalStoriesMel) && base == "melboard.portal2.sr") {
 				base = "mel.portal2.sr";
