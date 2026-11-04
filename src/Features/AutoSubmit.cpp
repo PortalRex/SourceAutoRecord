@@ -24,13 +24,14 @@
 #include <string>
 
 #define API_BASE_AUTORENDER "https://autorender.portal2.sr/api"
-// The new boards while they're tested before taking over board.portal2.sr: one address for
-// both games, so Mel asks it for Mel's maps by name.
-#define PREVIEW_BOARDS "preview.portal2.sr"
 #define AUTOSUBMIT_TOAST_TAG "autosubmit"
 #define COOP_NAME_MESSAGE_TYPE "coop-name"
 #define API_KEY_FILE "autosubmit.key"
 #define OLD_API_KEY_FILE "autosubmit_key.txt"
+// The new boards' beta (preview.portal2.sr), before they take over board.portal2.sr: runs go
+// there too, with the key from this file (its address, then the key, as the new boards' Settings
+// page gives it), so the boards' own key in autosubmit.key keeps working beside it.
+#define BETA_API_KEY_FILE "autosubmit_beta.key"
 
 bool AutoSubmit::g_cheated = false;
 int AutoSubmit::g_paused = 0;
@@ -60,14 +61,23 @@ ON_EVENT(PRE_TICK) {
 	if (engine->IsGamePaused() && SpeedrunTimer::IsRunning() && !client->g_leaderboardOpen) AutoSubmit::g_paused++;
 }
 
-static std::string g_api_base;
-static std::string g_api_key;
-static bool g_key_valid;
-static CURL *g_curl;
+// A boards site runs are submitted to, with its own key, map ids and connection: the boards
+// (autosubmit.key) and the new boards' beta (autosubmit_beta.key).
+struct Board {
+	// Before its console messages and toasts ("" for the boards).
+	const char *prefix;
+	std::string api_base;
+	std::string api_key;
+	bool key_valid = false;
+	CURL *curl = nullptr;
+	std::map<std::string, std::string> map_ids;
+};
+
+static Board g_board{""};
+static Board g_beta{"Beta boards: "};
 static CURL *g_curl_search;
 static std::thread g_worker;
 static std::thread g_worker_search;
-static std::map<std::string, std::string> g_map_ids;
 static bool g_is_querying;
 static std::vector<json11::Json> g_times;
 
@@ -83,7 +93,9 @@ static bool ensureCurlReady(CURL **curl) {
 	return true;
 }
 
-static std::optional<std::string> request(CURL *curl, std::string url) {
+// The response body of a 200, else nothing; `refusal` gets the body of any other answer (why
+// the boards refused).
+static std::optional<std::string> request(CURL *curl, std::string url, std::string *refusal = nullptr) {
 	curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
 	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
@@ -111,69 +123,72 @@ static std::optional<std::string> request(CURL *curl, std::string url) {
 
 	if (res != CURLE_OK) {
 		THREAD_PRINT("ERROR IN AUTOSUBMIT REQUEST TO %s: %s\n", url.c_str(), curl_easy_strerror(res));
+	} else if (code != 200 && refusal) {
+		*refusal = response;
 	}
 
 	return res == CURLE_OK && code == 200 ? response : std::optional<std::string>{};
 }
 
-static void testApiKey() {
-	if (!ensureCurlReady(&g_curl)) {
-		THREAD_PRINT("Failed to test API key!\n");
+static void testApiKey(Board &board) {
+	if (!ensureCurlReady(&board.curl)) {
+		THREAD_PRINT("%sFailed to test API key!\n", board.prefix);
 		return;
 	}
 
-	curl_mime *form = curl_mime_init(g_curl);
+	curl_mime *form = curl_mime_init(board.curl);
 	curl_mimepart *field;
 
 	field = curl_mime_addpart(form);
 	curl_mime_name(field, "auth_hash");
-	curl_mime_data(field, g_api_key.c_str(), CURL_ZERO_TERMINATED);
+	curl_mime_data(field, board.api_key.c_str(), CURL_ZERO_TERMINATED);
 
-	curl_easy_setopt(g_curl, CURLOPT_MIMEPOST, form);
+	curl_easy_setopt(board.curl, CURLOPT_MIMEPOST, form);
 
-	auto response = request(g_curl, g_api_base + "/validate-user");
+	auto response = request(board.curl, board.api_base + "/validate-user");
 
 	curl_mime_free(form);
 
 	if (!response) {
-		THREAD_PRINT("API key invalid!\n");
+		THREAD_PRINT("%sAPI key invalid!\n", board.prefix);
 		return;
 	}
 
-	g_key_valid = true;
-	THREAD_PRINT("API key valid!\n");
+	board.key_valid = true;
+	THREAD_PRINT("%sAPI key valid!\n", board.prefix);
 
 	// FIXME: add API maps endpoint on board.portal2.sr
 	if (sar.game->Is(SourceGame_Portal2)) {
 		for (const auto &map : Game::maps) {
 			if (strlen(map.chamberId) > 0) {
-				g_map_ids.insert({map.fileName, map.chamberId});
+				board.map_ids.insert({map.fileName, map.chamberId});
 			}
 		}
 		return;
 	}
 
 	// A form of its own: the one above is freed, and the handle would still post it.
-	form = curl_mime_init(g_curl);
+	form = curl_mime_init(board.curl);
 
 	field = curl_mime_addpart(form);
 	curl_mime_name(field, "auth_hash");
-	curl_mime_data(field, g_api_key.c_str(), CURL_ZERO_TERMINATED);
+	curl_mime_data(field, board.api_key.c_str(), CURL_ZERO_TERMINATED);
 
-	if (g_api_base == "https://" PREVIEW_BOARDS "/api-v2") {
+	// The beta's one address serves both games: Mel asks it for Mel's maps by name.
+	if (&board == &g_beta) {
 		field = curl_mime_addpart(form);
 		curl_mime_name(field, "game");
 		curl_mime_data(field, "mel", CURL_ZERO_TERMINATED);
 	}
 
-	curl_easy_setopt(g_curl, CURLOPT_MIMEPOST, form);
+	curl_easy_setopt(board.curl, CURLOPT_MIMEPOST, form);
 
-	response = request(g_curl, g_api_base + "/download-maps");
+	response = request(board.curl, board.api_base + "/download-maps");
 
 	curl_mime_free(form);
 
 	if (!response) {
-		THREAD_PRINT("Failed to download maps!\n");
+		THREAD_PRINT("%sFailed to download maps!\n", board.prefix);
 		return;
 	}
 
@@ -181,43 +196,49 @@ static void testApiKey() {
 	auto json = json11::Json::parse(*response, err);
 
 	if (err != "") {
-		THREAD_PRINT("Failed to parse maps JSON: %s\n", err.c_str());
+		THREAD_PRINT("%sFailed to parse maps JSON: %s\n", board.prefix, err.c_str());
 		return;
 	}
 
 	for (auto &map : json["maps"].array_items()) {
-		g_map_ids.insert({map["level_name"].string_value(), map["id"].string_value()});
+		board.map_ids.insert({map["level_name"].string_value(), map["id"].string_value()});
 	}
 
-	THREAD_PRINT("Downloaded %i maps!\n", g_map_ids.size());
+	THREAD_PRINT("%sDownloaded %i maps!\n", board.prefix, board.map_ids.size());
+}
+
+// The board the in-game times list asks: the boards, or the beta when only it has a valid key.
+static Board &searchBoard() {
+	return !g_board.key_valid && g_beta.key_valid ? g_beta : g_board;
 }
 
 std::optional<std::string> AutoSubmit::GetMapId(std::string map_name) {
-	auto it = g_map_ids.find(map_name);
-	if (it == g_map_ids.end()) {
+	auto &map_ids = searchBoard().map_ids;
+	auto it = map_ids.find(map_name);
+	if (it == map_ids.end()) {
 		return {};
 	}
 
 	return it->second;
 }
 
-static std::optional<int> getCurrentPbScore(std::string map_id) {
-	if (!ensureCurlReady(&g_curl)) return {};
+static std::optional<int> getCurrentPbScore(Board &board, std::string map_id) {
+	if (!ensureCurlReady(&board.curl)) return {};
 
-	curl_mime *form = curl_mime_init(g_curl);
+	curl_mime *form = curl_mime_init(board.curl);
 	curl_mimepart *field;
 
 	field = curl_mime_addpart(form);
 	curl_mime_name(field, "auth_hash");
-	curl_mime_data(field, g_api_key.c_str(), CURL_ZERO_TERMINATED);
+	curl_mime_data(field, board.api_key.c_str(), CURL_ZERO_TERMINATED);
 
 	field = curl_mime_addpart(form);
 	curl_mime_name(field, "mapId");
 	curl_mime_data(field, map_id.c_str(), CURL_ZERO_TERMINATED);
 
-	curl_easy_setopt(g_curl, CURLOPT_MIMEPOST, form);
+	curl_easy_setopt(board.curl, CURLOPT_MIMEPOST, form);
 
-	auto response = request(g_curl, g_api_base + "/current-pb");
+	auto response = request(board.curl, board.api_base + "/current-pb");
 
 	curl_mime_free(form);
 
@@ -264,13 +285,14 @@ void AutoSubmit::Search(std::string map) {
 
 json11::Json::array AutoSubmit::GetTopScores(std::string &map_id) {
 	if (!ensureCurlReady(&g_curl_search)) return {};
+	auto &board = searchBoard();
 
 	curl_mime *form = curl_mime_init(g_curl_search);
 	curl_mimepart *field;
 
 	field = curl_mime_addpart(form);
 	curl_mime_name(field, "auth_hash");
-	curl_mime_data(field, g_api_key.c_str(), CURL_ZERO_TERMINATED);
+	curl_mime_data(field, board.api_key.c_str(), CURL_ZERO_TERMINATED);
 
 	field = curl_mime_addpart(form);
 	curl_mime_name(field, "mapId");
@@ -286,7 +308,7 @@ json11::Json::array AutoSubmit::GetTopScores(std::string &map_id) {
 
 	curl_easy_setopt(g_curl_search, CURLOPT_MIMEPOST, form);
 
-	auto response = request(g_curl_search, g_api_base + "/top-scores");
+	auto response = request(g_curl_search, board.api_base + "/top-scores");
 
 	curl_mime_free(form);
 
@@ -310,62 +332,16 @@ const std::vector<json11::Json>& AutoSubmit::GetTimes() {
 	return g_times;
 }
 
-static void submitTime(int score, std::string demopath, bool coop, std::string map_id, std::optional<std::string> rename_if_pb, std::optional<std::string> replay_append_if_pb) {
+// Posts a run to a board's auto-submit: whether it took it (`refusal`: why not, when it said).
+static bool postRun(Board &board, int score, const std::string &demopath, bool coop, const std::string &map_id, std::string *refusal) {
 	auto score_str = std::to_string(score);
 
-	if (!g_key_valid) {
-		if (rename_if_pb) {
-			std::filesystem::rename(demopath, *rename_if_pb);
-		}
-		if (replay_append_if_pb) {
-			engine->demoplayer->replayName += *replay_append_if_pb;
-		}
-		return;
-	}
-
-	auto cur_pb = getCurrentPbScore(map_id);
-	if (cur_pb) {
-		if (*cur_pb > -1 && score >= *cur_pb) {
-			THREAD_PRINT("Not PB; not submitting.\n");
-			Scheduler::OnMainThread([=]() {
-				Event::Trigger<Event::MAYBE_AUTOSUBMIT>({score, coop, false});
-			});
-			return;
-		}
-	}
-
-	// If we couldn't detect if this run PBd, rename the demo anyway to be
-	// safe
-
-	if (rename_if_pb) {
-		std::filesystem::rename(demopath, *rename_if_pb);
-		demopath = *rename_if_pb;
-	}
-
-	if (replay_append_if_pb) {
-		engine->demoplayer->replayName += *replay_append_if_pb;
-	}
-
-	if (!cur_pb) {
-		toastHud.AddToast(AUTOSUBMIT_TOAST_TAG, "An error occurred submitting this time - couldn't fetch PB");
-		return;
-	}
-
-	if (!ensureCurlReady(&g_curl)) {
-		toastHud.AddToast(AUTOSUBMIT_TOAST_TAG, "An error occurred submitting this time - couldn't ready CURL");
-		return;
-	}
-
-	Scheduler::OnMainThread([=]() {
-		Event::Trigger<Event::MAYBE_AUTOSUBMIT>({score, coop, true});
-	});
-
-	curl_mime *form = curl_mime_init(g_curl);
+	curl_mime *form = curl_mime_init(board.curl);
 	curl_mimepart *field;
 
 	field = curl_mime_addpart(form);
 	curl_mime_name(field, "auth_hash");
-	curl_mime_data(field, g_api_key.c_str(), CURL_ZERO_TERMINATED);
+	curl_mime_data(field, board.api_key.c_str(), CURL_ZERO_TERMINATED);
 
 	field = curl_mime_addpart(form);
 	curl_mime_name(field, "mapId");
@@ -385,16 +361,104 @@ static void submitTime(int score, std::string demopath, bool coop, std::string m
 		curl_mime_data(field, AutoSubmit::g_partner_name.c_str(), CURL_ZERO_TERMINATED);
 	}
 
-	curl_easy_setopt(g_curl, CURLOPT_MIMEPOST, form);
+	curl_easy_setopt(board.curl, CURLOPT_MIMEPOST, form);
 
-	auto resp = request(g_curl, g_api_base +  "/auto-submit");
+	auto resp = request(board.curl, board.api_base + "/auto-submit", refusal);
 
 	curl_mime_free(form);
 
-	if (!resp) {
+	return resp.has_value();
+}
+
+// Submits to the boards (and renames the demo when it may be a PB there); the demo's path after.
+static std::string submitToBoards(int score, std::string demopath, bool coop, std::string map_id, std::optional<std::string> rename_if_pb, std::optional<std::string> replay_append_if_pb) {
+	if (!g_board.key_valid) {
+		if (rename_if_pb) {
+			std::filesystem::rename(demopath, *rename_if_pb);
+			demopath = *rename_if_pb;
+		}
+		if (replay_append_if_pb) {
+			engine->demoplayer->replayName += *replay_append_if_pb;
+		}
+		return demopath;
+	}
+
+	auto cur_pb = getCurrentPbScore(g_board, map_id);
+	if (cur_pb) {
+		if (*cur_pb > -1 && score >= *cur_pb) {
+			THREAD_PRINT("Not PB; not submitting.\n");
+			Scheduler::OnMainThread([=]() {
+				Event::Trigger<Event::MAYBE_AUTOSUBMIT>({score, coop, false});
+			});
+			return demopath;
+		}
+	}
+
+	// If we couldn't detect if this run PBd, rename the demo anyway to be
+	// safe
+
+	if (rename_if_pb) {
+		std::filesystem::rename(demopath, *rename_if_pb);
+		demopath = *rename_if_pb;
+	}
+
+	if (replay_append_if_pb) {
+		engine->demoplayer->replayName += *replay_append_if_pb;
+	}
+
+	if (!cur_pb) {
+		toastHud.AddToast(AUTOSUBMIT_TOAST_TAG, "An error occurred submitting this time - couldn't fetch PB");
+		return demopath;
+	}
+
+	if (!ensureCurlReady(&g_board.curl)) {
+		toastHud.AddToast(AUTOSUBMIT_TOAST_TAG, "An error occurred submitting this time - couldn't ready CURL");
+		return demopath;
+	}
+
+	Scheduler::OnMainThread([=]() {
+		Event::Trigger<Event::MAYBE_AUTOSUBMIT>({score, coop, true});
+	});
+
+	if (!postRun(g_board, score, demopath, coop, map_id, nullptr)) {
 		toastHud.AddToast(AUTOSUBMIT_TOAST_TAG, "An error occurred submitting this time - didn't get a response");
 	} else {
 		toastHud.AddToast(AUTOSUBMIT_TOAST_TAG, "Successfully submitted time to boards!");
+	}
+	return demopath;
+}
+
+// Submits to the beta boards when it's a PB there, whatever the boards made of it.
+static void submitToBeta(int score, const std::string &demopath, bool coop, const std::string &map_id) {
+	auto cur_pb = getCurrentPbScore(g_beta, map_id);
+	if (!cur_pb) {
+		toastHud.AddToast(AUTOSUBMIT_TOAST_TAG, "Beta boards: an error occurred submitting this time - couldn't fetch PB");
+		return;
+	}
+	if (*cur_pb > -1 && score >= *cur_pb) {
+		THREAD_PRINT("Beta boards: not PB; not submitting.\n");
+		return;
+	}
+
+	std::string refusal;
+	if (postRun(g_beta, score, demopath, coop, map_id, &refusal)) {
+		toastHud.AddToast(AUTOSUBMIT_TOAST_TAG, "Successfully submitted time to the beta boards!");
+	} else if (!refusal.empty()) {
+		// The beta boards say why (and whether the demo was kept for their moderators).
+		toastHud.AddToast(AUTOSUBMIT_TOAST_TAG, "Beta boards didn't take this time: " + refusal.substr(0, 300));
+	} else {
+		toastHud.AddToast(AUTOSUBMIT_TOAST_TAG, "Beta boards: an error occurred submitting this time - didn't get a response");
+	}
+}
+
+// Submits a run to the boards, then to the beta boards (the demo as the boards left it), each
+// where it knows the map.
+static void submitTime(int score, std::string demopath, bool coop, std::optional<std::string> map_id, std::optional<std::string> beta_map_id, std::optional<std::string> rename_if_pb, std::optional<std::string> replay_append_if_pb) {
+	if (map_id) {
+		demopath = submitToBoards(score, demopath, coop, *map_id, rename_if_pb, replay_append_if_pb);
+	}
+	if (beta_map_id) {
+		submitToBeta(score, demopath, coop, *beta_map_id);
 	}
 }
 
@@ -439,15 +503,34 @@ static void convertOldApiKeys() {
 	console->Print("Successfully converted API key file!\n");
 }
 
-void AutoSubmit::LoadApiKey(bool output_nonexist) {
-	convertOldApiKeys();
+// Whether a key is all letters and digits, as the boards make them.
+static bool keyShapeOk(const std::string &key) {
+	bool valid = key.size() > 0;
+	for (auto c : key) {
+		if (c >= 'a' && c <= 'z') continue;
+		if (c >= 'A' && c <= 'Z') continue;
+		if (c >= '0' && c <= '9') continue;
+		valid = false;
+	}
+	return valid;
+}
 
+// Sets a board's address and key, to be tested.
+static void setKey(Board &board, const std::string &base, const std::string &key) {
+	board.api_base = "https://" + base + "/api-v2";
+	board.api_key = key;
+	board.key_valid = false;
+	board.map_ids.clear();
+}
+
+// The boards' key from autosubmit.key: whether one was set.
+static bool loadBoardsKey(bool output_nonexist) {
 	auto filepath = fileSystem->FindFileSomewhere(API_KEY_FILE);
 	if (!filepath.has_value()) {
 		if (output_nonexist) {
 			console->Print("API key file " API_KEY_FILE " does not exist!\n");
 		}
-		return;
+		return false;
 	}
 
 	std::string base;
@@ -459,7 +542,6 @@ void AutoSubmit::LoadApiKey(bool output_nonexist) {
 		while (!f.eof()) {
 			std::getline(f, base) && std::getline(f, key);
 			if (sar.game->Is(SourceGame_Portal2) && base == "board.portal2.sr") break;
-			if (base == PREVIEW_BOARDS) break;
 			if (sar.game->Is(SourceGame_PortalStoriesMel) && base == "mel.portal2.sr") break;
 			if (sar.game->Is(SourceGame_PortalStoriesMel) && base == "melboard.portal2.sr") {
 				base = "mel.portal2.sr";
@@ -477,26 +559,62 @@ void AutoSubmit::LoadApiKey(bool output_nonexist) {
 
 	key.erase(std::remove_if(key.begin(), key.end(), isspace), key.end());
 
-	bool valid = key.size() > 0;
-	for (auto c : key) {
-		if (c >= 'a' && c <= 'z') continue;
-		if (c >= 'A' && c <= 'Z') continue;
-		if (c >= '0' && c <= '9') continue;
-		valid = false;
-	}
-
-	if (!valid) {
+	if (!keyShapeOk(key)) {
 		console->Print("Invalid API key!\n");
-		return;
+		return false;
 	}
 
-	g_api_base = "https://"	+ base + "/api-v2";
-	g_api_key = key;
-	g_key_valid = false;
+	setKey(g_board, base, key);
 	console->Print("Set API key! Testing...\n");
+	return true;
+}
+
+// The beta boards' key from autosubmit_beta.key (its first address and key, for both games):
+// whether one was set. Without the file, runs go to the boards only.
+static bool loadBetaKey(bool output_nonexist) {
+	auto filepath = fileSystem->FindFileSomewhere(BETA_API_KEY_FILE);
+	if (!filepath.has_value()) {
+		if (output_nonexist) {
+			console->Print("Beta boards: no " BETA_API_KEY_FILE " file; submitting to the boards only.\n");
+		}
+		setKey(g_beta, "", "");
+		return false;
+	}
+
+	std::string base;
+	std::string key;
+
+	{
+		std::ifstream f(filepath.value());
+		std::getline(f, base) && std::getline(f, key);
+	}
+
+	base.erase(std::remove_if(base.begin(), base.end(), isspace), base.end());
+	key.erase(std::remove_if(key.begin(), key.end(), isspace), key.end());
+
+	if (base.empty() || !keyShapeOk(key)) {
+		console->Print("Beta boards: invalid API key in " BETA_API_KEY_FILE " (its address, then the key)!\n");
+		setKey(g_beta, "", "");
+		return false;
+	}
+
+	setKey(g_beta, base, key);
+	console->Print("Beta boards: set API key for %s! Testing...\n", base.c_str());
+	return true;
+}
+
+void AutoSubmit::LoadApiKey(bool output_nonexist) {
+	convertOldApiKeys();
+
+	bool boards = loadBoardsKey(output_nonexist);
+	bool beta = loadBetaKey(output_nonexist);
+	if (!boards && !beta) return;
 
 	if (g_worker.joinable()) g_worker.join();
-	g_worker = std::thread(testApiKey);
+	g_worker = std::thread([=]() {
+		if (boards) testApiKey(g_board);
+		if (beta) testApiKey(g_beta);
+	});
 }
 
 size_t writeCallback(void *contents, size_t size, size_t nmemb, std::string *buffer) {
@@ -627,24 +745,35 @@ void AutoSubmit::FinishRun(float final_time, const char *demopath, std::optional
 	return;
 #endif
 
-	auto it = g_map_ids.find(engine->GetCurrentMapName());
-	if (it == g_map_ids.end()) {
-		console->Print("Unknown map; not autosubmitting\n");
+	auto map_name = engine->GetCurrentMapName();
+	auto mapIdOn = [&](Board &board) -> std::optional<std::string> {
+		auto it = board.map_ids.find(map_name);
+		if (it == board.map_ids.end()) return {};
+		return it->second;
+	};
+	auto map_id = mapIdOn(g_board);
+	auto beta_map_id = g_beta.key_valid ? mapIdOn(g_beta) : std::nullopt;
+	std::string demo = demopath;
+
+	if (!map_id) {
+		if (!beta_map_id) console->Print("Unknown map; not autosubmitting\n");
 		if (rename_if_pb) {
 			std::filesystem::rename(demopath, *rename_if_pb);
+			demo = *rename_if_pb;
 		}
 		if (replay_append_if_pb) {
 			engine->demoplayer->replayName += *replay_append_if_pb;
 		}
-		return;
+		if (!beta_map_id) return;
+		// Renamed already: the beta boards get it as it is now.
+		rename_if_pb.reset();
+		replay_append_if_pb.reset();
 	}
-
-	auto map_id = it->second;
 
 	int score = (int)floor(final_time * 100);
 
 	if (g_worker.joinable()) g_worker.join();
-	g_worker = std::thread(submitTime, score, std::string(demopath), Utils::StartsWith(engine->GetCurrentMapName().c_str(), "mp_"), map_id, rename_if_pb, replay_append_if_pb);
+	g_worker = std::thread(submitTime, score, demo, Utils::StartsWith(map_name.c_str(), "mp_"), map_id, beta_map_id, rename_if_pb, replay_append_if_pb);
 }
 
 ON_EVENT(SAR_UNLOAD) {
