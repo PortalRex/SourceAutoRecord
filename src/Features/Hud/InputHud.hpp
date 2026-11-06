@@ -5,6 +5,15 @@
 #include <string>
 
 class InputHud : public Hud {
+public:
+	// where a user command reached the HUD from
+	enum InputSource {
+		INPUT_SOURCE_CLIENT,
+		INPUT_SOURCE_SERVER,
+		INPUT_SOURCE_DEMO,
+		INPUT_SOURCE_COUNT
+	};
+
 private:
 	// info about current user input
 	struct {
@@ -13,7 +22,15 @@ private:
 		QAngle angles[2]{0, 0};  //storing two angles to calculate delta
 		QAngle prevUsedAngles{0, 0};
 		bool awaitingFrameDraw = true;
+		// Button presses since the last frame, counted per command, as several
+		// commands can run in one frame. The same command can reach the HUD
+		// from more than one source, so each source keeps its own count.
+		int lastButtonBits[INPUT_SOURCE_COUNT] = {0};
+		int lastCommandNumber[INPUT_SOURCE_COUNT] = {0};
+		int presses[INPUT_SOURCE_COUNT][32] = {{0}};
 	} inputInfo[2];
+
+	int GetPresses(int slot, int button);
 
 	// input hud elements (buttons and vector displays)
 	struct InputHudElement {
@@ -57,7 +74,7 @@ private:
 
 public:
 	InputHud();
-	void SetInputInfo(int slot, int buttonBits, Vector movement);
+	void SetInputInfo(int slot, int buttonBits, Vector movement, InputSource source, int commandNumber);
 	bool ShouldDraw() override;
 	void Paint(int slot) override;
 	bool GetCurrentSize(int &xSize, int &ySize) override;

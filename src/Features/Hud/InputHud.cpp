@@ -44,9 +44,24 @@ InputHud::InputHud()
 	ApplyPreset("normal", true);
 }
 
-void InputHud::SetInputInfo(int slot, int buttonBits, Vector movement) {
+void InputHud::SetInputInfo(int slot, int buttonBits, Vector movement, InputSource source, int commandNumber) {
 
 	auto &info = this->inputInfo[slot];
+
+	// A command can come again (demo playback decodes a few twice when it
+	// starts), so only count presses in commands newer than the last one. Far
+	// behind means the numbering started over, like on a new connection.
+	int age = info.lastCommandNumber[source] - commandNumber;
+	if (age < 0 || age >= 64) {
+		if (sar_ihud.GetBool()) {
+			int newlyDown = buttonBits & ~info.lastButtonBits[source];
+			for (int i = 0; i < 32; ++i) {
+				if ((unsigned)newlyDown & (1u << i)) info.presses[source][i]++;
+			}
+		}
+		info.lastButtonBits[source] = buttonBits;
+		info.lastCommandNumber[source] = commandNumber;
+	}
 
 	// this was supposed to ensures that the button press is visible for at least one frame
 	// idk doesn't seem to make much difference lmfao
@@ -58,6 +73,19 @@ void InputHud::SetInputInfo(int slot, int buttonBits, Vector movement) {
 	
 	info.movement = movement;
 	info.awaitingFrameDraw = true;
+}
+
+// presses of a button since the last frame
+int InputHud::GetPresses(int slot, int button) {
+	auto &info = this->inputInfo[slot];
+	int presses = 0;
+	for (int i = 0; i < 32; ++i) {
+		if (!((unsigned)button & (1u << i))) continue;
+		for (int source = 0; source < INPUT_SOURCE_COUNT; ++source) {
+			presses = std::max(presses, info.presses[source][i]);
+		}
+	}
+	return presses;
 }
 
 bool InputHud::ShouldDraw() {
@@ -211,14 +239,20 @@ void InputHud::Paint(int slot) {
 			else
 				down = inputInfo.buttonBits & element.type;
 
+			int presses;
+			if (element.isNormalKey)
+				presses = down && !element.lastDown[slot];
+			else
+				presses = GetPresses(slot, element.type);
+			if (presses > 0) {
+				element.pressCount[slot] += presses;
+				element.lastPressTick[slot] = tick;
+			}
+
 			bool active = down;
 			if (down) {
 				if (element.pressedTick[slot] == -1) {
 					element.pressedTick[slot] = tick;
-				}
-				if (!element.lastDown[slot]) {
-					element.pressCount[slot]++;
-					element.lastPressTick[slot] = tick;
 				}
 			} else {
 				if (tick - element.pressedTick[slot] < element.minHold) {
@@ -274,6 +308,7 @@ void InputHud::Paint(int slot) {
 	}
 
 	// now that we've drawn pressed buttons, we can release them
+	memset(inputInfo.presses, 0, sizeof inputInfo.presses);
 }
 
 bool InputHud::GetCurrentSize(int &xSize, int &ySize) {

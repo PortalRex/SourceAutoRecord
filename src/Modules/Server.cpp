@@ -287,7 +287,7 @@ DETOUR(Server::PlayerRunCommand, CUserCmd *cmd, void *moveHelper) {
 	Cheats::CheckFloorReportals();
 	if (!sv_cheats.GetBool()) g_promoFlagsPatch->Restore(); // We only want to check this once per map load, to preserve the intended behavior.
 
-	inputHud.SetInputInfo(slot, cmd->buttons, {cmd->sidemove, cmd->forwardmove, cmd->upmove});
+	inputHud.SetInputInfo(slot, cmd->buttons, {cmd->sidemove, cmd->forwardmove, cmd->upmove}, InputHud::INPUT_SOURCE_SERVER, cmd->command_number);
 
 	strafeHud.SetData(slot, thisptr, cmd, true);
 

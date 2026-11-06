@@ -295,7 +295,7 @@ DETOUR(Client::LevelInitPreEntity, const char *levelName) {
 DETOUR(Client::CreateMove, float flInputSampleTime, CUserCmd *cmd) {
 	int slot = engine->IsOrange() ? 1 : 0;
 	if (!in_forceuser.isReference || (in_forceuser.isReference && !in_forceuser.GetBool())) {
-		inputHud.SetInputInfo(engine->IsCoop() ? slot : 0, cmd->buttons, {cmd->sidemove, cmd->forwardmove, cmd->upmove});
+		inputHud.SetInputInfo(engine->IsCoop() ? slot : 0, cmd->buttons, {cmd->sidemove, cmd->forwardmove, cmd->upmove}, InputHud::INPUT_SOURCE_CLIENT, cmd->command_number);
 	}
 
 	if (sv_cheats.GetBool() && engine->hoststate->m_activeGame) {
@@ -328,7 +328,7 @@ DETOUR(Client::CreateMove, float flInputSampleTime, CUserCmd *cmd) {
 }
 DETOUR(Client::CreateMove2, float flInputSampleTime, CUserCmd *cmd) {
 	if (in_forceuser.GetBool()) {
-		inputHud.SetInputInfo(1, cmd->buttons, {cmd->sidemove, cmd->forwardmove, cmd->upmove});
+		inputHud.SetInputInfo(1, cmd->buttons, {cmd->sidemove, cmd->forwardmove, cmd->upmove}, InputHud::INPUT_SOURCE_CLIENT, cmd->command_number);
 	}
 
 	if (sar_strafesync.GetBool()) {
@@ -632,10 +632,10 @@ DETOUR(Client::DecodeUserCmdFromBuffer, int nSlot, int buf, signed int sequence_
 		// A bit weird - for some reason, when playing back Orange
 		// demos, nSlot is 0 even though the player's actual slot
 		// (including in HUD stuff) is 1. This works as a workaround
-		inputHud.SetInputInfo(0, cmd->buttons, cmdMove);
-		inputHud.SetInputInfo(1, cmd->buttons, cmdMove);
+		inputHud.SetInputInfo(0, cmd->buttons, cmdMove, InputHud::INPUT_SOURCE_DEMO, cmd->command_number);
+		inputHud.SetInputInfo(1, cmd->buttons, cmdMove, InputHud::INPUT_SOURCE_DEMO, cmd->command_number);
 	} else if (nSlot == 1) {
-		inputHud.SetInputInfo(1, cmd->buttons, cmdMove);
+		inputHud.SetInputInfo(1, cmd->buttons, cmdMove, InputHud::INPUT_SOURCE_DEMO, cmd->command_number);
 	}
 
 	if (sar_strafesync.GetBool()) {
