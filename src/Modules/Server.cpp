@@ -661,6 +661,14 @@ static void __cdecl AcceptInput_Hook(void *thisptr, const char *inputName, void 
 			if (!strcmp(entName, "@transition_from_map") && !strcmp(inputName, "Trigger"))
 				end = true;
 		}
+		if (start && engine->IsCoop()) {
+			// these maps have no dialogue holding up the exit, so there's nothing to time
+			static const char *noDialogueMaps[] = {"mp_coop_start", "mp_coop_doors", "mp_coop_race_2", "mp_coop_fling_1", "mp_coop_catapult_1"};
+			auto map = engine->GetCurrentMapName();
+			for (auto noDialogueMap : noDialogueMaps) {
+				if (map == noDialogueMap) start = false;
+			}
+		}
 		if (start) {
 			transition_time = session->GetTick();
 		}
