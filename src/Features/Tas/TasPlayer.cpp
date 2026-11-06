@@ -50,7 +50,9 @@ void SetPlaybackVars(bool active) {
 	static Variable mat_motion_blur_enabled("mat_motion_blur_enabled");
 
 	if (active && !was_active) {
-		old_forceuser = in_forceuser.GetInt();
+		// Camera drive mode overrides the int value without touching the
+		// string, so read the string to get what the user actually set
+		old_forceuser = std::atoi(in_forceuser.GetString());
 		old_hostframerate = host_framerate.GetInt();
 		old_interpolate = cl_interpolate.GetBool();
 		old_motionblur = mat_motion_blur_enabled.GetBool();
