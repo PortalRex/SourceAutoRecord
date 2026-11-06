@@ -29,6 +29,10 @@ extern "C" {
 static CURL *g_curl;
 static curl_slist *g_httpHdrs;
 static std::thread g_worker;
+// Set once an update is installed. The running SAR has been moved aside
+// (Windows) or deleted (Linux), so installing another one before a restart
+// would replace the image of the running SAR.
+static bool g_updateInstalled = false;
 
 #define MAX_VERSION_COMPONENTS 6
 
@@ -288,6 +292,11 @@ void checkUpdate(CURL *curl, Channel channel, bool print, std::function<void(int
 void doUpdate(Channel channel, int successAction, bool force) {
 	std::string name, dlUrl, pdbUrl;
 
+	if (g_updateInstalled) {
+		THREAD_PRINT("SAR has already been updated. Restart your game before updating again.\n");
+		return;
+	}
+
 	THREAD_PRINT("Querying for latest version...\n");
 
 	if (!getLatestVersion(g_curl, true, &name, &dlUrl, &pdbUrl, channel)) {
@@ -354,6 +363,7 @@ void doUpdate(Channel channel, int successAction, bool force) {
 		return;
 	}
 
+	g_updateInstalled = true;
 	THREAD_PRINT("Success! You should now restart your game.\n");
 
 	if (successAction == 1) {
