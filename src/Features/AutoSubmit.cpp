@@ -16,9 +16,12 @@
 
 #include <cctype>
 #include <curl/curl.h>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -64,6 +67,38 @@ static CURL *g_curl;
 static CURL *g_curl_search;
 static std::thread g_worker;
 static std::thread g_worker_search;
+
+// Board requests run on these threads, and one can take up to the request
+// timeout when the boards are unreachable. The main thread must never wait
+// for them, so jobs queue behind the running one instead of joining it.
+static std::mutex g_jobs_mutex;
+static std::deque<std::function<void()>> g_jobs;
+static bool g_jobs_running;
+
+static void runJobs() {
+	while (true) {
+		std::function<void()> job;
+		{
+			std::lock_guard<std::mutex> lock(g_jobs_mutex);
+			if (g_jobs.empty()) {
+				g_jobs_running = false;
+				return;
+			}
+			job = std::move(g_jobs.front());
+			g_jobs.pop_front();
+		}
+		job();
+	}
+}
+
+static void queueJob(std::function<void()> job) {
+	std::lock_guard<std::mutex> lock(g_jobs_mutex);
+	g_jobs.push_back(std::move(job));
+	if (g_jobs_running) return;
+	if (g_worker.joinable()) g_worker.join();  // finished: it cleared g_jobs_running
+	g_jobs_running = true;
+	g_worker = std::thread(runJobs);
+}
 static std::map<std::string, std::string> g_map_ids;
 static bool g_is_querying;
 static std::vector<json11::Json> g_times;
@@ -217,27 +252,44 @@ static std::optional<int> getCurrentPbScore(std::string map_id) {
 	return atoi(str.c_str());
 }
 
+static std::mutex g_search_mutex;
+static std::optional<std::string> g_search_next;  // asked for while a search was running
+static bool g_search_running;
+
 static void startSearching(std::string mapName) {
-	auto map_id = AutoSubmit::GetMapId(mapName);
-	if (!map_id.has_value()) {
-		g_is_querying = false;
-		return;
+	while (true) {
+		auto map_id = AutoSubmit::GetMapId(mapName);
+		if (map_id.has_value()) {
+			auto json = AutoSubmit::GetTopScores(*map_id);
+
+			g_times.clear();
+			for (auto score : json) {
+				g_times.push_back(score);
+			}
+		}
+
+		std::lock_guard<std::mutex> lock(g_search_mutex);
+		if (!g_search_next) {
+			g_search_running = false;
+			g_is_querying = false;
+			return;
+		}
+		mapName = *g_search_next;
+		g_search_next.reset();
 	}
-
-	auto json = AutoSubmit::GetTopScores(*map_id);
-
-	g_times.clear();
-	for (auto score : json) {
-		g_times.push_back(score);
-	}
-
-	g_is_querying = false;
 }
 
 void AutoSubmit::Search(std::string map) {
 	g_is_querying = true;
 
-	if (g_worker_search.joinable()) g_worker_search.join();
+	std::lock_guard<std::mutex> lock(g_search_mutex);
+	if (g_search_running) {
+		// only the newest map matters; the running search picks it up
+		g_search_next = map;
+		return;
+	}
+	if (g_worker_search.joinable()) g_worker_search.join();  // finished
+	g_search_running = true;
 	g_worker_search = std::thread(startSearching, map);
 }
 
@@ -473,8 +525,7 @@ void AutoSubmit::LoadApiKey(bool output_nonexist) {
 	g_key_valid = false;
 	console->Print("Set API key! Testing...\n");
 
-	if (g_worker.joinable()) g_worker.join();
-	g_worker = std::thread(testApiKey);
+	queueJob(testApiKey);
 }
 
 size_t writeCallback(void *contents, size_t size, size_t nmemb, std::string *buffer) {
@@ -508,6 +559,7 @@ void retrieveMtriggers(int rank, std::string map_name) {
 		if (curl) {
 			std::string apiCall = std::string(API_BASE_AUTORENDER) + "/v1/mtriggers/search?game_dir=portal2&map_name=" + map_name + "&board_rank=" + std::to_string(rank);
 			curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, true);
+			curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30);
 			curl_easy_setopt(curl, CURLOPT_URL, apiCall.c_str());
 			curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
 			curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
@@ -558,32 +610,26 @@ void retrieveMtriggers(int rank, std::string map_name) {
 }
 
 CON_COMMAND_COMPLETION(sar_speedrun_get_mtriggers, "sar_speedrun_get_mtriggers <rank=wr> - prints mtriggers of specific run.\n", ({"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"})) {
+	auto map = engine->GetCurrentMapName();
 	if (args.ArgC() != 2) {
-		if (g_worker.joinable()) g_worker.join();
-		g_worker = std::thread(retrieveMtriggers, 1, engine->GetCurrentMapName());
+		queueJob([=]() { retrieveMtriggers(1, map); });
 		return;
 	}
 
-	if (g_worker.joinable()) g_worker.join();
-	g_worker = std::thread(retrieveMtriggers, std::atoi(args[1]), engine->GetCurrentMapName());
+	auto rank = std::atoi(args[1]);
+	queueJob([=]() { retrieveMtriggers(rank, map); });
 }
 
 CON_COMMAND_COMPLETION(sar_speedrun_get_mtriggers_map, "sar_speedrun_get_mtriggers_map <map=current> <rank=wr> - prints mtriggers of specific run on specific map.\n", (Portal2::mapNames)) {
 	if (args.ArgC() != 3) {
-		if (args.ArgC() == 2) {
-			if (g_worker.joinable()) g_worker.join();
-			g_worker = std::thread(retrieveMtriggers, 1, args[1]);
-			return;
-		}
-
-		if (g_worker.joinable()) g_worker.join();
-		g_worker = std::thread(retrieveMtriggers, 1, engine->GetCurrentMapName());
+		std::string map = args.ArgC() == 2 ? args[1] : engine->GetCurrentMapName();
+		queueJob([=]() { retrieveMtriggers(1, map); });
 		return;
 	}
 
-	if (g_worker.joinable()) g_worker.join();
 	auto rank = std::atoi(args[2]);
-	g_worker = std::thread(retrieveMtriggers, rank, args[1]);
+	std::string map = args[1];
+	queueJob([=]() { retrieveMtriggers(rank, map); });
 }
 
 
@@ -621,11 +667,21 @@ void AutoSubmit::FinishRun(float final_time, const char *demopath, std::optional
 
 	int score = (int)floor(final_time * 100);
 
-	if (g_worker.joinable()) g_worker.join();
-	g_worker = std::thread(submitTime, score, std::string(demopath), Utils::StartsWith(engine->GetCurrentMapName().c_str(), "mp_"), map_id, rename_if_pb, replay_append_if_pb);
+	std::string demo = demopath;
+	bool coop = Utils::StartsWith(engine->GetCurrentMapName().c_str(), "mp_");
+	queueJob([=]() { submitTime(score, demo, coop, map_id, rename_if_pb, replay_append_if_pb); });
 }
 
 ON_EVENT(SAR_UNLOAD) {
+	{
+		// drop what hasn't started; the running request still has to finish
+		std::lock_guard<std::mutex> lock(g_jobs_mutex);
+		g_jobs.clear();
+	}
+	{
+		std::lock_guard<std::mutex> lock(g_search_mutex);
+		g_search_next.reset();
+	}
 	if (g_worker.joinable()) g_worker.join();
 	if (g_worker_search.joinable()) g_worker_search.join();
 }
