@@ -95,7 +95,6 @@ bool PortalPlacementHud::GetCurrentSize(int &xSize, int &ySize) {
 
 ON_EVENT(PRE_TICK) {
 	// update portal placement info
-	// Will fizzle partner portals in coop
 	if (sv_cheats.GetBool() && sar_pp_hud.GetBool() && event.simulating) {
 		void *player = server->GetPlayer(GET_SLOT() + 1);
 
@@ -136,10 +135,13 @@ ON_EVENT(PRE_TICK) {
 			SE(portalgun)->field<CBaseHandle>("m_hSecondaryPortal") = ((IHandleEntity *)orangePortal)->GetRefEHandle();
 		}
 
+		// Testing a shot must not fizzle the portals it would overlap
+		server->AllowPartnerPortalFizzle(false);
 		// Check blue
 		g_canPlaceBlue = server->TraceFirePortal(portalgun, camPos, dir, false, 2, g_bluePlacementInfo);
 		// Check Orange
 		g_canPlaceOrange = server->TraceFirePortal(portalgun, camPos, dir, true, 2, g_orangePlacementInfo);
+		server->AllowPartnerPortalFizzle(true);
 	}
 }
 

@@ -537,6 +537,10 @@ SIGSCAN_DEFAULT(TraceFirePortal, "53 8B DC 83 EC 08 83 E4 F0 83 C4 04 55 8B 6B 0
                                  "55 89 E5 57 56 8D B5 F4 F8 FF FF 53 81 EC 30 07 00 00 8B 45 14 6A 00 8B 5D 0C FF 75 08 56 89 85 D0 F8 FF FF")
 SIGSCAN_DEFAULT(FindPortal, "55 8B EC 0F B6 45 08 8D 0C 80 03 C9 53 8B 9C 09 ? ? ? ? 03 C9 56 57 85 DB 74 3C 8B B9 ? ? ? ? 33 C0 33 F6 EB 08",
                             "55 57 56 53 83 EC 2C 8B 44 24 40 8B 74 24 48 8B 7C 24 44 89 44 24 14 0F B6 C0 8D 04 80 89 74 24 0C C1 E0 02")
+SIGSCAN_DEFAULT(PartnerPortalFizzle, "83 F9 02 75 6E 83 F8 06 75 69 8B 0D ? ? ? ? 85 C9 74 13 E8",
+                                     "83 FD 02 0F 85 ? ? ? ? 83 F8 06 0F 85 ? ? ? ? A1 ? ? ? ? 85 C0 74 14") // VerifyPortalPlacementAndFizzleBlockingPortals: placed by player (2), overlaps partner portal (6)
+OFFSET_DEFAULT(PartnerPortalFizzle_jump, 8, 12) // ^ -> jump past the partner fizzle when not overlapping
+OFFSET_DEFAULT(TraceFirePortal_ShotPartnerPortal, 0x215, 0x501) // TraceFirePortal -> call that fizzles a partner portal the shot hits (co-op), right after the placement helper check
 SIGSCAN_DEFAULT(ViewPunch, "55 8B EC A1 ? ? ? ? 83 EC 0C 83 78 30 00 56 8B F1 0F 85 ? ? ? ? 8B 16 8B 82 00 05 00 00 FF D0 84 C0 0F 85 ? ? ? ? 8B 45 08 F3 0F 10 1D ? ? ? ? F3 0F 10 00",
                            "55 57 56 53 83 EC 1C A1 ? ? ? ? 8B 5C 24 30 8B 74 24 34 8B 40 30 85 C0 75 38 8B 03 8B 80 04 05 00 00 3D ? ? ? ? 75 36 8B 83 B8 0B 00 00 8B 0D ? ? ? ?")
 SIGSCAN_DEFAULT(UTIL_FindClosestPassableSpace, "53 8B DC 83 EC 08 83 E4 F0 83 C4 04 55 8B 6B 04 89 6C 24 04 8B EC 81 EC 98 02 00 00 8B 43 0C 8B 48 08 F3 0F 10 48 04 F3 0F 10 00 F3 0F 10 3D ? ? ? ?",

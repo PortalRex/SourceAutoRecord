@@ -534,6 +534,21 @@ static void setAircontrol(int val) {
 }
 
 Memory::Patch *g_portalsThruPortalsPatch;
+Memory::Patch *g_partnerPortalFizzlePatch;
+Memory::Patch *g_shotPartnerPortalPatch;
+
+// In co-op, a portal shot by a player fizzles the partner's portal it hits or
+// overlaps. Turn that off around traces that only test where a portal would go.
+void Server::AllowPartnerPortalFizzle(bool allow) {
+	for (auto patch : {g_partnerPortalFizzlePatch, g_shotPartnerPortalPatch}) {
+		if (!patch->IsInit()) continue;
+		if (allow) {
+			patch->Restore();
+		} else {
+			patch->Execute();
+		}
+	}
+}
 
 static void setPortalsThruPortals(bool val) {
 	if (!g_portalsThruPortalsPatch->IsInit()) return;
@@ -963,6 +978,36 @@ bool Server::Init() {
 		g_portalsThruPortalsPatch->Restore();
 	}
 	FindPortal = (_FindPortal)Memory::Scan(this->Name(), Offsets::FindPortal);
+	g_partnerPortalFizzlePatch = new Memory::Patch();
+	auto partnerPortalFizzle = Memory::Scan(this->Name(), Offsets::PartnerPortalFizzle, Offsets::PartnerPortalFizzle_jump);
+	if (partnerPortalFizzle) {
+#ifdef _WIN32
+		unsigned char skipFizzle[] = {0xEB}; // jne short -> jmp short
+#else
+		unsigned char skipFizzle[] = {0x90, 0xE9}; // jne near -> nop; jmp near
+#endif
+		g_partnerPortalFizzlePatch->Execute(partnerPortalFizzle, skipFizzle);
+		g_partnerPortalFizzlePatch->Restore();
+	}
+	g_shotPartnerPortalPatch = new Memory::Patch();
+	if (TraceFirePortal && Offsets::TraceFirePortal_ShotPartnerPortal) {
+		// the call that fizzles a partner portal the shot hits; returns whether it did
+		auto shotPartnerPortal = (uintptr_t)TraceFirePortal + Offsets::TraceFirePortal_ShotPartnerPortal;
+		auto code = (unsigned char *)shotPartnerPortal;
+#ifdef _WIN32
+		// push eax; mov ecx, edi; call (thiscall, pops its argument) -> xor al, al
+		bool found = code[0] == 0x50 && code[1] == 0x8B && code[2] == 0xCF && code[3] == 0xE8;
+		unsigned char notShot[] = {0x32, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+#else
+		// call (caller pops the arguments) -> xor al, al
+		bool found = code[0] == 0xE8 && code[5] == 0x83 && code[6] == 0xC4;
+		unsigned char notShot[] = {0x32, 0xC0, 0x90, 0x90, 0x90};
+#endif
+		if (found) {
+			g_shotPartnerPortalPatch->Execute(shotPartnerPortal, notShot);
+			g_shotPartnerPortalPatch->Restore();
+		}
+	}
 
 	ViewPunch = (decltype(ViewPunch))Memory::Scan(this->Name(), Offsets::ViewPunch);
 
@@ -1078,6 +1123,10 @@ void Server::Shutdown() {
 	SAFE_DELETE(g_aircontrolPatch);
 	g_portalsThruPortalsPatch->Restore();
 	SAFE_DELETE(g_portalsThruPortalsPatch);
+	g_partnerPortalFizzlePatch->Restore();
+	SAFE_DELETE(g_partnerPortalFizzlePatch);
+	g_shotPartnerPortalPatch->Restore();
+	SAFE_DELETE(g_shotPartnerPortalPatch);
 	g_chatPatch->Restore();
 	SAFE_DELETE(g_chatPatch);
 	g_unblockChatPatch->Restore();

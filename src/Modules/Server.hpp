@@ -77,6 +77,7 @@ public:
 	int GetSplitScreenPlayerSlot(void *entity);
 	void KillEntity(void *entity);
 	float GetCMTimer();
+	void AllowPartnerPortalFizzle(bool allow);
 
 public:
 	// CPortal_Player::PlayerRunCommand

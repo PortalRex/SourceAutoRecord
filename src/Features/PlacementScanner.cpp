@@ -330,7 +330,9 @@ static void endScan(bool success) {
 
 static bool testRay(uintptr_t portalgun, Vector origin, Vector dir, bool checkMatchArea) {
 	TracePortalPlacementInfo_t info;
+	server->AllowPartnerPortalFizzle(false);
 	server->TraceFirePortal(portalgun, origin, dir, false, 2, info);
+	server->AllowPartnerPortalFizzle(true);
 
 	bool success;
 	switch (info.ePlacementResult) {
