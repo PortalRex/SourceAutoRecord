@@ -736,7 +736,7 @@ DETOUR(Server::GameFrame, bool simulating) {
 		console->Print("CServerGameDLL::GameFrame %s (host=%d server=%d client=%d)\n", simulating ? "simulating" : "non-simulating", host, server, client);
 	}
 
-	tasPlayer->Update();
+	tasPlayer->Update(simulating);
 
 	int tick = session->GetTick();
 

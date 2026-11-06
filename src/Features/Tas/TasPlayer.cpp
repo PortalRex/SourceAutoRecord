@@ -884,7 +884,7 @@ ON_EVENT_P(SESSION_START, 999) { // before rng manip hook
 	}
 }
 
-void TasPlayer::Update() {
+void TasPlayer::Update(bool simulating) {
 	if (active && !paused) {
 		if (!ready) {
 			SetPlaybackVars(true); // Set host_framerate and friends asap!
@@ -895,7 +895,12 @@ void TasPlayer::Update() {
 		if (ready && session->isRunning) {
 			SetPlaybackVars(true);
 			if (!IsRunning()) {
-				PostStart();  // script has started its playback. Adjust the tick counter and offset
+				// The start tick has to come from a tick the server simulates:
+				// started while paused (from the console in singleplayer, say)
+				// the player's tickbase is behind it, and playback goes out of step
+				if (simulating) {
+					PostStart();  // script has started its playback. Adjust the tick counter and offset
+				}
 			} else {
 				if (engine->IsGamePaused() && !wasEnginePaused) {
 					wasEnginePaused = true;

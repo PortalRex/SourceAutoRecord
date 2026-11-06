@@ -79,7 +79,7 @@ private:
 	unsigned currentExtraViewAnalogRawFramebulkIndex[2];
 
 public:
-	void Update();
+	void Update(bool simulating);
 	void UpdateServer();
 
 	inline int GetTick() const { return currentTick; };
