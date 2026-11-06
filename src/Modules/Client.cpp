@@ -228,6 +228,12 @@ void Client::SetMouseActivated(bool state) {
 	}
 }
 
+bool Client::PuzzleMakerRequestQuitGame() {
+	if (!Offsets::PuzzleMakerRequestQuitGame) return true;
+	auto func = this->g_ClientDLL->Original<bool(__rescall *)(void *)>(Offsets::PuzzleMakerRequestQuitGame);
+	return func(this->g_ClientDLL->ThisPtr());
+}
+
 CMStatus Client::GetChallengeStatus() {
 	if (engine->IsOrange()) {
 		return sv_bonus_challenge.GetBool() ? CMStatus::CHALLENGE : CMStatus::NONE;

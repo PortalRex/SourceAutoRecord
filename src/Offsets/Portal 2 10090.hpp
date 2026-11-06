@@ -56,6 +56,7 @@ OFFSET_DEFAULT(ApplyMouse_Mid, 0x3E1, -1)  // ApplyMouse -> d9 ? ? [e8] ? ? ? ? 
 OFFSET_DEFAULT(SteamControllerMove, 58, 58)
 OFFSET_EMPTY(JoyStickApplyMovement)
 OFFSET_DEFAULT(LevelInitPreEntity, 5, 5)
+OFFSET_DEFAULT(PuzzleMakerRequestQuitGame, 86, 0) // engine -> "Exit the engine." xref -> quit callback -> first g_ClientDLL vtable call
 
 // CInputSystem
 OFFSET_EMPTY(KeyDown)

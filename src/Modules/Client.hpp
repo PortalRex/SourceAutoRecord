@@ -92,6 +92,7 @@ public:
 	void ShowLocator(Vector position, Vector normal, Color color);
 	void SetMouseActivated(bool state);
 	CMStatus GetChallengeStatus();
+	bool PuzzleMakerRequestQuitGame();
 	int GetSplitScreenPlayerSlot(void *entity);
 	static Vector GetPlayerSize(bool ducked);
 	void ClFrameStageNotify(int stage);

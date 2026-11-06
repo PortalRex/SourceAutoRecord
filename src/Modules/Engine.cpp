@@ -535,10 +535,15 @@ DETOUR_COMMAND(Engine::plugin_unload) {
 		engine->plugin_unload_callback(args);
 	}
 }
+// The engine's quit asks the client first, and the Puzzlemaker refuses while
+// the puzzle has unsaved changes so it can show its save prompt instead. Ask
+// the same before unloading, or SAR unloads while the game keeps running.
 DETOUR_COMMAND(Engine::exit) {
+	if (!client->PuzzleMakerRequestQuitGame()) return;
 	engine->SafeUnload("exit");
 }
 DETOUR_COMMAND(Engine::quit) {
+	if (!client->PuzzleMakerRequestQuitGame()) return;
 	engine->SafeUnload("quit");
 }
 DETOUR_COMMAND(Engine::restart) {
