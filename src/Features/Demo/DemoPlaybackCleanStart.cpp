@@ -212,12 +212,14 @@ void updateTransitionViewmodel() {
 // so it's stopped here: a one-shot on the player's static channel at the sound script's volume (0.9), within the
 // first frames after the load (watched from the end of the previous map, so it's caught on the frame it starts).
 // In co-op it plays on each player once at the load and again when they spawn, as the transition video ends (up to
-// ~350 ticks after the load, which is when SAR's render resumes).
+// ~350 ticks after the load, which is when SAR's render resumes; in challenge mode ~40 frames after the load). The
+// spawn's sound is the first one stopped some frames after the load's.
 const int TRANSITION_SOUND_FRAMES = 15, TRANSITION_SOUND_LOAD_FRAMES = 600, TRANSITION_SOUND_COOP_FRAMES = 600;
-const int TRANSITION_SOUND_COOP_SPAWN_FRAMES = 60, TRANSITION_SOUND_COOP_HOLD_FRAMES = 30, TRANSITION_SOUND_COOP_RAMP_FRAMES = 30;
+const int TRANSITION_SOUND_COOP_SPAWN_GAP_FRAMES = 10, TRANSITION_SOUND_COOP_HOLD_FRAMES = 30, TRANSITION_SOUND_COOP_RAMP_FRAMES = 30;
 int g_transitionSoundFrames = 0;
 int g_transitionSoundUnmuteFrames = 0;
 int g_transitionSoundRampFrames = 0;
+int g_transitionSoundLoadStop = -1; // g_transitionSoundFrames when the load's sound was stopped (co-op), or -1
 
 struct SndInfo_t { // IEngineSound::GetActiveSounds entry (0x34 bytes)
 	int m_nGuid;
@@ -293,9 +295,13 @@ void updateTransitionSounds() {
 	bool stopped = stopTransitionStartSounds();
 	if (!session->isRunning) return;
 	bool coop = engine->GetMaxClients() >= 2;
-	if (coop && stopped && g_transitionSoundFrames < TRANSITION_SOUND_COOP_FRAMES - TRANSITION_SOUND_COOP_SPAWN_FRAMES) {
-		g_transitionSoundUnmuteFrames = TRANSITION_SOUND_COOP_HOLD_FRAMES;
-		g_transitionSoundRampFrames = 0;
+	if (coop && stopped) {
+		if (g_transitionSoundLoadStop < 0) {
+			g_transitionSoundLoadStop = g_transitionSoundFrames;
+		} else if (g_transitionSoundFrames <= g_transitionSoundLoadStop - TRANSITION_SOUND_COOP_SPAWN_GAP_FRAMES) {
+			g_transitionSoundUnmuteFrames = TRANSITION_SOUND_COOP_HOLD_FRAMES;
+			g_transitionSoundRampFrames = 0;
+		}
 	}
 	// SAR's frame event runs after the frame's audio is mixed: keep the frame after the stop muted too, and unmute
 	// once the stopped sound is out of the mix. The co-op spawn sound leaves a reverb tail, so it's held longer
@@ -360,6 +366,7 @@ ON_EVENT(SESSION_END) {
 	g_transitionSoundFrames = TRANSITION_SOUND_LOAD_FRAMES;
 	g_transitionSoundUnmuteFrames = 0;
 	g_transitionSoundRampFrames = 0;
+	g_transitionSoundLoadStop = -1;
 	muteTransitionVolume();
 }
 
@@ -374,6 +381,7 @@ ON_EVENT(SESSION_START) {
 		g_transitionSoundFrames = coop ? TRANSITION_SOUND_COOP_FRAMES : TRANSITION_SOUND_FRAMES;
 		g_transitionSoundUnmuteFrames = coop ? 0 : 2;
 		g_transitionSoundRampFrames = 0;
+		g_transitionSoundLoadStop = -1;
 		updateTransitionSounds();
 	}
 
