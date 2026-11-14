@@ -237,6 +237,17 @@ static_assert(sizeof(SndInfo_t) == 0x34, "SndInfo_t size");
 
 const int ENGINESOUND_STOPSOUNDBYGUID = 16, ENGINESOUND_GETACTIVESOUNDS = 18;
 const int CHAN_STATIC = 6;
+const int FILESYSTEM_STRING = 40; // IFileSystem::String(const FileNameHandle_t &, char *, int)
+
+// Whether an active sound plays the power-up sound's file (weapon_ambient\wpn_portalgun_activation_01.wav). If the
+// name can't be read, the channel and volume checks alone decide, as before.
+bool isTransitionStartSound(int filenameHandle) {
+	static void *fs = Interface::GetPtr(MODULE("filesystem_stdio"), "VFileSystem017");
+	if (!fs) return true;
+	char name[260] = "";
+	if (!Memory::VMT<bool(__rescall *)(void *, const int &, char *, int)>(fs, FILESYSTEM_STRING)(fs, filenameHandle, name, sizeof(name))) return true;
+	return strstr(name, "wpn_portalgun_activation") != nullptr;
+}
 
 bool stopTransitionStartSounds() {
 	static void *engineSound = Interface::GetPtr(MODULE("engine"), "IEngineSoundClient003");
@@ -258,6 +269,9 @@ bool stopTransitionStartSounds() {
 		auto &sound = buffer[i];
 		if (sound.m_nSoundSource < 1 || sound.m_nSoundSource > engine->GetMaxClients() || sound.m_nChannel != CHAN_STATIC) continue;
 		if (sound.m_flVolume < 0.85f || sound.m_flVolume > 0.95f) continue;
+		// Other sounds pass the checks above: the falling-wind loop on the same channel climbs through 0.9 while a
+		// player falls fast. Stopping it muted the whole mix for a second after a fall early in a co-op map.
+		if (!isTransitionStartSound(sound.m_filenameHandle)) continue;
 		Memory::VMT<void(__rescall *)(void *, int, bool)>(engineSound, ENGINESOUND_STOPSOUNDBYGUID)(engineSound, sound.m_nGuid, true);
 		stopped = true;
 	}
