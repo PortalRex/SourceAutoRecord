@@ -797,6 +797,8 @@ DETOUR_COMMAND(Client::playvideo_end_level_transition) {
 	return Client::playvideo_end_level_transition_callback(args);
 }
 
+void ClearDemoPortalStatic(const Vector &camera); // Features/Demo/DemoPlaybackCleanStart.cpp
+
 DETOUR_T(void, Client::OverrideView, CViewSetup *m_View) {
 	Client::OverrideView(thisptr, m_View);
 
@@ -806,6 +808,7 @@ DETOUR_T(void, Client::OverrideView, CViewSetup *m_View) {
 	Stitcher::OverrideView(view);
 	GhostEntity::FollowPov(view);
 	engine->demoplayer->OverrideView(view);
+	ClearDemoPortalStatic(view->origin);
 
 	ViewSetupCopy(view, m_View);
 }

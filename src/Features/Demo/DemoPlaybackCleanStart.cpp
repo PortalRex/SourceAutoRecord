@@ -7,7 +7,10 @@
 #include <Interface.hpp>
 #include <Utils/Memory.hpp>
 #include <Utils/SDK/UtlMemory.hpp>
+#include <Utils/Math.hpp>
+#include <Entity.hpp>
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -22,6 +25,12 @@ Variable sar_demo_clean_transitions("sar_demo_clean_transitions", "1", 0,
 	"When a demo loads another map mid-playback (a spliced demo), starts the new map with the previous map's "
 	"auto-exposure and quickly eases to the new scene's, instead of fading in from the default, and skips "
 	"projected textures to their color, keeps the viewmodel from replaying its draw animation, and stops the portal gun's power-up sound.\n", 0);
+
+Variable sar_demo_clean_portals("sar_demo_clean_portals", "0", 0,
+	"In demo playback, a new portal opens four times as fast and shows the view through it without the static the "
+	"game fades out over a second after a portal is placed (or its partner is), so a run that enters a portal right "
+	"after shooting it sees through it, and particles aren't drawn in the few frames the camera passes through a "
+	"portal (its sparks would fill the screen). Unlinked portals keep their static.\n", 0);
 
 
 bool g_tonemapScaleDemoLookupInProgress = false;
@@ -337,7 +346,129 @@ void updateTransitionSounds() {
 	if (g_transitionSoundFrames == 0) restoreTransitionVolume();
 }
 
+// A placed portal, and the portal linked to it, get full static (C_Prop_Portal::m_fStaticAmount = 1) that its
+// client think fades out by frame time over one second; it's drawn over the view through the portal, so a run that
+// enters a portal right after shooting it shows mostly static. Its opening animation (m_fOpenAmount, 0 to 1 in half a
+// second) also hides the view through it until it's 85% open. sar_demo_clean_portals clears the static just before
+// each view is drawn and runs the opening four times as fast (an eighth of a second).
+const int PORTAL_STATIC_AMOUNT = 0x3510, PORTAL_SECONDARY_STATIC_AMOUNT = 0x3514, PORTAL_OPEN_AMOUNT = 0x3518;
+const float PORTAL_OPEN_RATE = 2.0f, PORTAL_OPEN_SPEEDUP = 4.0f; // the game opens a portal at 2 per second
+std::vector<int> g_demoPortals;
+bool g_demoPortalsOpened = false; // this frame's extra opening is done (several views can be drawn per frame)
+
+void findDemoPortals() {
+	g_demoPortals.clear();
+	g_demoPortalsOpened = false;
+	if (!sar_demo_clean_portals.GetBool() || !engine->demoplayer->IsPlaying() || !session->isRunning) return;
+	for (int i = 1; i < Offsets::NUM_ENT_ENTRIES; ++i) {
+		auto ent = client->GetEntity(i);
+		if (!ent) continue;
+		auto cc = ent->GetClientClass();
+		if (cc && cc->m_pNetworkName && !strcmp(cc->m_pNetworkName, "CProp_Portal")) g_demoPortals.push_back(i);
+	}
+}
+
+// The sparks that stream into every portal fill the screen as the camera dives into one. While the camera is about to
+// pass through an open portal, or just has, particles aren't drawn (r_drawparticles 0). Standing near a portal doesn't
+// count: the camera has to be heading in. Turning them off only clears the screen if it's done before the camera gets
+// close (once drawn up close they stay on screen), so it looks ahead PORTAL_PASS_SECONDS, and it's decided at the start
+// of the frame, from the camera of the frame before moved on by one frame.
+const float PORTAL_HALF_WIDTH = 32.0f, PORTAL_HALF_HEIGHT = 56.0f, PORTAL_PASS_MARGIN = 48.0f;
+const float PORTAL_PASS_SECONDS = 0.6f, PORTAL_PASS_NEAR = 16.0f, PORTAL_PASS_BEHIND = 32.0f;
+float g_savedDrawParticles = -1.0f; // r_drawparticles while it's held at 0
+Vector g_demoCamera, g_demoCameraVelocity; // the main view's camera in the last frame, and how fast it moved
+bool g_demoCameraValid = false;
+
+void restoreDemoParticles() {
+	if (g_savedDrawParticles < 0.0f) return;
+	Variable("r_drawparticles").SetValue(g_savedDrawParticles);
+	g_savedDrawParticles = -1.0f;
+}
+
+bool isOverPortalOpening(const Vector &rel, const Vector &right, const Vector &up) {
+	return fabsf(rel.Dot(right)) < PORTAL_HALF_WIDTH + PORTAL_PASS_MARGIN && fabsf(rel.Dot(up)) < PORTAL_HALF_HEIGHT + PORTAL_PASS_MARGIN;
+}
+
+// Whether the camera, moving at `velocity`, is passing through the portal: right at its opening or just behind it, or
+// heading into the opening and through it within PORTAL_PASS_SECONDS.
+bool isPassingThroughPortal(ClientEnt *portal, const Vector &camera, const Vector &velocity) {
+	auto activated = EntField::getClientOffset(portal, "m_bActivated");
+	if (activated.second == EntField::Type::NONE || !*(bool *)((uintptr_t)portal + activated.first)) return false;
+	Vector forward, right, up;
+	Math::AngleVectors(portal->abs_angles(), &forward, &right, &up);
+	Vector rel = camera - portal->abs_origin();
+	float depth = rel.Dot(forward);
+	if (depth < PORTAL_PASS_NEAR && depth > -PORTAL_PASS_BEHIND) return isOverPortalOpening(rel, right, up);
+	if (depth < 0.0f) return false;
+	float approach = -velocity.Dot(forward);
+	if (approach <= 0.0f || depth > approach * PORTAL_PASS_SECONDS) return false;
+	// where it crosses the portal's plane
+	return isOverPortalOpening(rel + velocity * (depth / approach), right, up);
+}
+
+bool isDemoPortal(ClientEnt *ent) {
+	if (!ent) return false;
+	auto cc = ent->GetClientClass();
+	return cc && cc->m_pNetworkName && !strcmp(cc->m_pNetworkName, "CProp_Portal");
+}
+
+// Start of a frame: particles off while the camera passes through a portal.
+void updateDemoPortalParticles() {
+	bool hide = false;
+	if (!g_demoPortals.empty() && g_demoCameraValid) {
+		Vector camera = g_demoCamera + g_demoCameraVelocity * engine->GetHostFrameTime();
+		for (int i : g_demoPortals) {
+			auto ent = client->GetEntity(i);
+			if (isDemoPortal(ent) && isPassingThroughPortal(ent, camera, g_demoCameraVelocity)) {
+				hide = true;
+				break;
+			}
+		}
+	}
+	if (!hide) {
+		restoreDemoParticles();
+		return;
+	}
+	Variable drawParticles("r_drawparticles");
+	if (drawParticles.ThisPtr() && g_savedDrawParticles < 0.0f) {
+		g_savedDrawParticles = drawParticles.GetFloat();
+		drawParticles.SetValue(0);
+	}
+}
+
+// Just before a view is drawn: no static, faster opening; and where the camera is, for the next frame.
+void ClearDemoPortalStatic(const Vector &camera) {
+	if (g_demoPortals.empty() || !engine->demoplayer->IsPlaying()) return;
+	float frameTime = engine->GetHostFrameTime();
+	// the main view comes first; the co-op partner's picture-in-picture view doesn't come through here
+	if (!g_demoPortalsOpened) {
+		g_demoCameraVelocity = g_demoCameraValid && frameTime > 0.0f ? (camera - g_demoCamera) * (1.0f / frameTime) : Vector();
+		g_demoCamera = camera;
+		g_demoCameraValid = true;
+	}
+	// the game's think already added this frame's share of the opening
+	float extraOpen = g_demoPortalsOpened ? 0.0f : frameTime * PORTAL_OPEN_RATE * (PORTAL_OPEN_SPEEDUP - 1.0f);
+	g_demoPortalsOpened = true;
+	for (int i : g_demoPortals) {
+		auto ent = client->GetEntity(i);
+		if (!isDemoPortal(ent)) continue;
+		auto base = (char *)ent;
+		float &staticAmount = *(float *)(base + PORTAL_STATIC_AMOUNT);
+		float &secondaryStaticAmount = *(float *)(base + PORTAL_SECONDARY_STATIC_AMOUNT);
+		float &openAmount = *(float *)(base + PORTAL_OPEN_AMOUNT);
+		// all three are 0..1; anything else means the layout isn't the one these offsets are for
+		if (openAmount < 0.0f || openAmount > 1.0f || staticAmount < 0.0f || staticAmount > 1.0f) continue;
+		if (secondaryStaticAmount < 0.0f || secondaryStaticAmount > 1.0f) continue;
+		staticAmount = 0.0f;
+		secondaryStaticAmount = 0.0f;
+		if (openAmount > 0.0f && openAmount < 1.0f) openAmount = std::min(openAmount + extraOpen, 1.0f);
+	}
+}
+
 ON_EVENT(FRAME) {
+	findDemoPortals();
+	if (g_demoPortals.empty()) g_demoCameraValid = false;
+	updateDemoPortalParticles();
 	updateTonemapScaleContinuousSearch();
 	updateTransitionSounds();
 	updateTransitionAdapt();
@@ -362,6 +493,7 @@ ON_EVENT(DEMO_STOP) {
 	g_transitionAdaptFrames = 0;
 	g_transitionViewmodelFrames = 0;
 	g_transitionSoundFrames = 0;
+	restoreDemoParticles();
 	restoreTransitionVolume();
 	disableTonemapScaleContinuousSearch();
 	stopTonemapScaleDemoLookup();
