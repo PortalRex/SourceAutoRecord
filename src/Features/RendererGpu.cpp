@@ -640,6 +640,7 @@ namespace {
 		IDirect3DQuery9 *query;
 		NvState state;
 		uint64_t pts;
+		bool idr;  // a map's first frame (RendererCore::TakeMapStart)
 	};
 
 	const int NV_MAX_SLOTS = 32;
@@ -942,6 +943,7 @@ namespace {
 		pic.outputBitstream = sl.bs;
 		pic.inputTimeStamp = sl.pts;
 		pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+		if (sl.idr) pic.encodePicFlags |= NV_ENC_PIC_FLAG_FORCEIDR;
 		st = fn.nvEncEncodePicture(g_nv.enc, &pic);
 		if (st != NV_ENC_SUCCESS && st != NV_ENC_ERR_NEED_MORE_INPUT) return nvFail("encoding a frame", st);
 		sl.state = NV_ENCODING;
@@ -1098,6 +1100,7 @@ namespace {
 					sl.query->Issue(D3DISSUE_END);
 					sl.state = NV_RENDERED;
 					sl.pts = g_nv.nextPts++;
+					sl.idr = RendererCore::TakeMapStart((int64_t)sl.pts);
 				}
 			} else if (emit && !g_gpu.broken) {
 				Slot &sl = newSlot(dev);

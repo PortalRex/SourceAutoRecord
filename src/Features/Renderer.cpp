@@ -63,7 +63,7 @@ static Variable snd_surround_speakers;
 static Variable sar_render_vbitrate("sar_render_vbitrate", "40000", 1, "Video bitrate used in renders (kbit/s)\n");
 static Variable sar_render_abitrate("sar_render_abitrate", "160", 1, "Audio bitrate used in renders (kbit/s)\n");
 static Variable sar_render_vcodec("sar_render_vcodec", "h264", "Video codec used in renders (h264, hevc, vp8, vp9, dnxhd)\n", 0);
-static Variable sar_render_acodec("sar_render_acodec", "aac", "Audio codec used in renders (aac, ac3, vorbis, opus, flac)\n", 0);
+static Variable sar_render_acodec("sar_render_acodec", "aac", "Audio codec used in renders (aac, ac3, vorbis, opus, flac, pcm)\n", 0);
 static Variable sar_render_quality("sar_render_quality", "35", 0, 50, "Render output quality, higher is better (50=lossless)\n");
 static Variable sar_render_fps("sar_render_fps", "60", 1, "Render output FPS\n");
 static Variable sar_render_sample_rate("sar_render_sample_rate", "44100", 1000, "Audio output sample rate\n");
@@ -432,8 +432,27 @@ AVFrame *RendererCore::AcquireVideoFrame() {
 	return f;
 }
 
+// Map starts in the current render (see RendererCore::TakeMapStart)
+static std::atomic<bool> g_mapStartPending{false};
+static std::mutex g_mapStartsLock;
+static std::vector<int64_t> g_mapStarts;
+// Video frames the main thread has emitted in this render, the audio's first pts (SAR's 0.1 s lead), and a new
+// map's audio still to be put in step with its video (see SND_RecordBuffer_Hook)
+static int64_t g_framesEmitted;
+static int64_t g_audioStartPts;
+static std::atomic<bool> g_audioResyncPending{false};
+
+bool RendererCore::TakeMapStart(int64_t frame) {
+	if (!g_mapStartPending.exchange(false)) return false;
+	std::lock_guard<std::mutex> lock(g_mapStartsLock);
+	g_mapStarts.push_back(frame);
+	return true;
+}
+
 void RendererCore::SubmitVideoFrame(AVFrame *frame) {
 	frame->pts = g_render.videoPts++;
+	// pooled frames keep the last use's type
+	frame->pict_type = TakeMapStart(frame->pts) ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
 	++g_render.framesCaptured;
 	g_render.encQueue.Push({EncItem::VIDEO, frame});
 }
@@ -496,6 +515,8 @@ static AVCodecID audioCodecFromName(const char *name) {
 	if (!strcmp(name, "vorbis")) return AV_CODEC_ID_VORBIS;
 	if (!strcmp(name, "opus")) return AV_CODEC_ID_OPUS;
 	if (!strcmp(name, "flac")) return AV_CODEC_ID_FLAC;
+	// uncompressed, for tools that cut and join renders (needs a container that takes it, e.g. mkv)
+	if (!strcmp(name, "pcm")) return AV_CODEC_ID_PCM_S16LE;
 	return AV_CODEC_ID_NONE;
 }
 
@@ -1068,8 +1089,17 @@ static void finishOutput() {
 		err = g_render.errorMsg;
 	}
 
+	std::string mapStarts;
+	{
+		std::lock_guard<std::mutex> lock(g_mapStartsLock);
+		for (auto f : g_mapStarts) mapStarts += " " + std::to_string(f);
+		g_mapStarts.clear();
+	}
+
 	Scheduler::OnMainThread([=]() {
 		if (!err.empty()) console->Print("%s\n", err.c_str());
+		// before "Rendered", which tools wait for
+		if (!mapStarts.empty()) console->Print("[render] map starts at frames:%s\n", mapStarts.c_str());
 		console->Print("Rendered %d frames to '%s'\n", frames, filename.c_str());
 		printStats(wall, frames);
 
@@ -1240,6 +1270,9 @@ static bool allocSession() {
 	g_render.audioFill = 0;
 	g_render.audioPts = a->nextPts;
 	g_render.channels = a->enc->channels;
+	g_audioStartPts = a->nextPts;
+	g_framesEmitted = 0;
+	g_audioResyncPending.store(false);
 
 	if (!g_render.useGpu) {
 		size_t n = (size_t)g_render.width * g_render.height * 4;
@@ -1406,6 +1439,11 @@ static void startRender() {
 		}
 	}
 
+	// a map's first frame (RendererCore::TakeMapStart) starts a new GOP
+	if (!strcmp(videoCodec->name, "libx264") || !strcmp(videoCodec->name, "libx265") || strstr(videoCodec->name, "_nvenc")) {
+		av_dict_set(&options, "forced-idr", "1", 0);
+	}
+
 	g_render.width = GetScreenWidth();
 	g_render.height = GetScreenHeight();
 
@@ -1482,6 +1520,11 @@ static void startRender() {
 
 	g_render.nextBlendIdx = 0;
 	g_render.videoPts = 0;
+	g_mapStartPending.store(false);
+	{
+		std::lock_guard<std::mutex> lock(g_mapStartsLock);
+		g_mapStarts.clear();
+	}
 	g_render.framesCaptured = 0;
 	g_render.captureUs = 0;
 	g_render.stallUs = 0;
@@ -1590,31 +1633,53 @@ static void SND_RecordBuffer_Hook() {
 	int *src = *g_snd_p;
 	int vol = *g_snd_vol;
 
+	// Audio against video. The engine mixes each frame's audio 0.1 s ahead (snd_mixahead), which the audio
+	// stream's 0.1 s start makes up for: in step, the audio recorded before a frame's own is exactly 0.1 s plus
+	// a frame's worth of samples per frame emitted. But the mixer starts slowly, and how far short of that it
+	// settles depends on the demo's first map (from ~15 ms late to ~65 ms early), which the render then kept
+	// for every map after it: the same map's sound landed differently depending on what came before it. Each
+	// new map's audio is put in step instead (a little silence added or dropped while it spawns). The first
+	// map keeps the mixer's start.
+	int samples = count / channels;
+	int64_t perFrame = g_render.samplerate / g_render.fps;
+	int64_t want = g_audioStartPts + (g_framesEmitted - 1) * perFrame; // the audio before this frame's
+	int64_t have = g_render.audioPts + g_render.audioFill;
+	int pad = 0;
+	if (g_audioResyncPending.exchange(false)) {
+		int64_t off = std::max<int64_t>(-g_render.samplerate / 2, std::min<int64_t>(g_render.samplerate / 2, want - have));
+		if (off > 0) pad = (int)off;
+		else g_dropAudioSamples += (int)-off; // the oldest of what comes next
+	}
+
+	auto put = [&](const int *s) {
+		for (int c = 0; c < channels; ++c) planes[c][g_render.audioFill] = s ? clip16((s[c] * vol) >> 8) : 0;
+		if (++g_render.audioFill == f->nb_samples) {
+			int n = f->nb_samples;
+			f->pts = g_render.audioPts;
+			g_render.audioPts += n;
+			// The encoder thread owns (and may free) f from here on
+			g_render.encQueue.Push({EncItem::AUDIO, f});
+
+			Stream *a = &g_render.audioStream;
+			g_render.audioFrame = f = allocAudioFrame(AV_SAMPLE_FMT_S16P, a->enc->channel_layout, a->enc->sample_rate, n);
+			g_render.audioFill = 0;
+			if (!f) {
+				RendererCore::ReportError("Failed to allocate audio frame!");
+				return false;
+			}
+			planes = (int16_t **)f->data;
+		}
+		return true;
+	};
+	for (int i = 0; i < pad; ++i)
+		if (!put(nullptr)) return;
+
 	for (int i = 0; i < count; i += channels) {
 		if (g_dropAudioSamples.load() > 0) {
 			--g_dropAudioSamples;
 			continue;
 		}
-		for (int c = 0; c < channels; ++c) {
-			planes[c][g_render.audioFill] = clip16((src[i + c] * vol) >> 8);
-		}
-
-		if (++g_render.audioFill == f->nb_samples) {
-			int samples = f->nb_samples;
-			f->pts = g_render.audioPts;
-			g_render.audioPts += samples;
-			// The encoder thread owns (and may free) f from here on
-			g_render.encQueue.Push({EncItem::AUDIO, f});
-
-			Stream *a = &g_render.audioStream;
-			g_render.audioFrame = f = allocAudioFrame(AV_SAMPLE_FMT_S16P, a->enc->channel_layout, a->enc->sample_rate, samples);
-			g_render.audioFill = 0;
-			if (!f) {
-				RendererCore::ReportError("Failed to allocate audio frame!");
-				return;
-			}
-			planes = (int16_t **)f->data;
-		}
+		if (!put(src + i)) return;
 	}
 }
 
@@ -1973,6 +2038,7 @@ void Renderer::Frame() {
 	} else {
 		captureCpu(accumulate, emit, sub);
 	}
+	if (emit) ++g_framesEmitted;
 }
 
 // }}}
@@ -1999,6 +2065,10 @@ void Renderer::OnTransitionVideoFadeout() {
 // without being rendered. A new map within the same demo resumes the render
 // the way a demo start does: once the map's intro fade has begun.
 ON_EVENT(SESSION_START) {
+	if (g_render.isRendering.load() && engine->demoplayer->IsPlaying()) {
+		g_mapStartPending.store(true);
+		g_audioResyncPending.store(true);
+	}
 	if (g_render.isRendering.load() && g_render.isPaused.load() && engine->demoplayer->IsPlaying()) {
 		Renderer::isDemoLoading = true;
 	}

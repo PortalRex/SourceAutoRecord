@@ -37,4 +37,10 @@ namespace RendererCore {
 	void AddStallTime(int64_t us);
 
 	int64_t NowMicros();
+
+	// A new map started while rendering (a demo spliced from several maps):
+	// true once, for the first video frame after it. That frame is made a
+	// keyframe and its number listed at the end of the render, so the video
+	// can be cut there without re-encoding.
+	bool TakeMapStart(int64_t frame);
 }  // namespace RendererCore
