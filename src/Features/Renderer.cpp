@@ -58,6 +58,12 @@ bool Renderer::isDemoLoading = false;
 // require some horrible mid-function detours.
 static Variable snd_surround_speakers;
 
+// Single-player runs ticks in pairs: a frame runs no tick and the next one two.
+// In demo playback the view interpolation then puts the in-between frame off
+// the half-way point between packets (the camera judders at 30 fps), so it's
+// turned off while a demo renders.
+static Variable sv_alternateticks;
+
 // h264, hevc, vp8, vp9, dnxhd
 // aac, ac3, vorbis, opus, flac
 static Variable sar_render_vbitrate("sar_render_vbitrate", "40000", 1, "Video bitrate used in renders (kbit/s)\n");
@@ -356,6 +362,9 @@ static struct
 	bool holding;
 	int holdFrames;
 	int64_t holdUntil;
+	// Main thread. sv_alternateticks to restore after the render.
+	bool alternateTicksOff;
+	int savedAlternateTicks;
 
 	// Audio: the encoder needs frame_size samples per frame, so we collect
 	// samples from the game until we have a full frame
@@ -1155,6 +1164,10 @@ static void stopRender(bool error) {
 	g_render.holding = true;
 	g_render.holdFrames = -1;
 	stopVirtualClock();
+	if (g_render.alternateTicksOff) {
+		g_render.alternateTicksOff = false;
+		sv_alternateticks.SetValue(g_render.savedAlternateTicks);
+	}
 	{
 		// Wait for an audio push in flight; no more audio after this
 		std::lock_guard<std::mutex> lock(g_render.audioLock);
@@ -1977,6 +1990,16 @@ void Renderer::Frame() {
 
 	if (!g_render.isRendering.load()) return;
 
+	// One tick per frame while a demo renders. A map load in the demo turns
+	// pairing back on (the recording's value), so this is checked every frame.
+	if (sv_alternateticks.ThisPtr() && engine->demoplayer->IsPlaying() && sv_alternateticks.GetInt() != 0) {
+		if (!g_render.alternateTicksOff) {
+			g_render.alternateTicksOff = true;
+			g_render.savedAlternateTicks = sv_alternateticks.GetInt();
+		}
+		sv_alternateticks.SetValue(0);
+	}
+
 	// Something (configs, sar_loads_uncap restoring after a load) put the
 	// cap back; frames this call may not have been simulated, so skip it
 	if (fps_max.GetFloat() != 0) {
@@ -2093,6 +2116,7 @@ void Renderer::Init(void **videomode) {
 #endif
 
 	snd_surround_speakers = Variable("snd_surround_speakers");
+	sv_alternateticks = Variable("sv_alternateticks");
 
 	SND_RecordBuffer = (void (*)())Memory::Scan(engine->Name(), Offsets::SND_RecordBuffer);
 #ifdef _WIN32
