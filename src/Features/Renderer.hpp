@@ -4,6 +4,9 @@
 
 namespace Renderer {
 	void Frame();
+	// Before the engine unloads the level (disconnect): lets the render thread
+	// finish the frames already handed to it, which still draw its models
+	void FinishQueuedFrames();
 	void Init(void **videomode);
 	void Cleanup();
 	bool IsRunning();

@@ -15,6 +15,8 @@ void RendererGpu::Finish() {}
 bool RendererGpu::Failed() { return false; }
 bool RendererGpu::Busy() { return false; }
 bool RendererGpu::SetSkipPresent(bool) { return false; }
+void RendererGpu::MarkFrameStart() {}
+bool RendererGpu::WaitForHandedOff(int) { return true; }
 void RendererGpu::Shutdown() {}
 
 #else
@@ -89,6 +91,13 @@ namespace {
 	std::atomic<bool> g_failed{false};
 	std::atomic<int> g_pending{0};
 	std::atomic<bool> g_sessionOpen{false};
+	// Functors are numbered as they're queued (main thread) and run in that
+	// order on the render thread: queued, last one run, and the last one
+	// queued before the current engine frame (already handed to the render
+	// thread).
+	std::atomic<int64_t> g_queuedSeq{0};
+	std::atomic<int64_t> g_doneSeq{0};
+	std::atomic<int64_t> g_handedOffSeq{0};
 
 	using ResetFn = HRESULT(WINAPI *)(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *);
 	ResetFn Reset_Target;
@@ -1156,7 +1165,8 @@ namespace {
 		enum Kind { BEGIN, CAPTURE, FINISH };
 
 		GpuFunctor(Kind kind)
-			: kind(kind) {
+			: kind(kind)
+			, seq(++g_queuedSeq) {
 			++g_pending;
 		}
 
@@ -1183,10 +1193,12 @@ namespace {
 				break;
 			}
 			if (kind != FINISH) g_gpu.runUs += RendererCore::NowMicros() - t0;
+			g_doneSeq.store(seq);
 			--g_pending;
 		}
 
 		Kind kind;
+		int64_t seq;
 		std::atomic<int> refs{1};
 		RendererGpu::Params params;
 		int subframe = 0;
@@ -1337,6 +1349,20 @@ bool RendererGpu::Failed() {
 
 bool RendererGpu::Busy() {
 	return g_sessionOpen.load() || g_pending.load() > 0;
+}
+
+void RendererGpu::MarkFrameStart() {
+	g_handedOffSeq.store(g_queuedSeq.load());
+}
+
+bool RendererGpu::WaitForHandedOff(int timeoutMs) {
+	int64_t target = g_handedOffSeq.load();
+	int64_t until = RendererCore::NowMicros() + (int64_t)timeoutMs * 1000;
+	while (g_doneSeq.load() < target && !g_failed.load()) {
+		if (RendererCore::NowMicros() > until) return false;
+		Sleep(1);
+	}
+	return true;
 }
 
 bool RendererGpu::SetSkipPresent(bool skip) {

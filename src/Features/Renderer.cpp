@@ -1935,7 +1935,17 @@ static void captureCpu(bool accumulate, bool emit, int subframe) {
 	g_render.convQueue.Push(item);
 }
 
+void Renderer::FinishQueuedFrames() {
+	// A GPU render's captures and encodes run on the render thread, which can
+	// then be a few frames behind (two 4K renders sharing the encoder): the
+	// demo's end disconnects and frees the level's models while it is still
+	// drawing them, and it crashed in the model cache
+	if (!RendererGpu::Busy()) return;
+	if (!RendererGpu::WaitForHandedOff(10000)) console->Print("[render] the render thread didn't catch up before the disconnect\n");
+}
+
 void Renderer::Frame() {
+	RendererGpu::MarkFrameStart();
 	if (g_render.holding && g_render.holdFrames >= 0 && (g_render.holdFrames-- == 0 || RendererCore::NowMicros() > g_render.holdUntil)) {
 		releaseHold();
 	}

@@ -322,6 +322,7 @@ float Engine::GetHostTime() {
 
 // CClientState::Disconnect
 DETOUR(Engine::Disconnect, bool bShowMainMenu) {
+	Renderer::FinishQueuedFrames();
 	session->Ended();
 	return Engine::Disconnect(thisptr, bShowMainMenu);
 }

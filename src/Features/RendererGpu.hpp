@@ -62,5 +62,12 @@ namespace RendererGpu {
 	// false if Present couldn't be hooked
 	bool SetSkipPresent(bool skip);
 
+	// Main thread, at the start of each engine frame: the work queued so far
+	// has been handed to the render thread (at the previous frame's end)
+	void MarkFrameStart();
+	// Main thread: waits (up to timeoutMs) until the render thread has run the
+	// work handed to it before this frame. Returns false on a timeout.
+	bool WaitForHandedOff(int timeoutMs);
+
 	void Shutdown();
 }  // namespace RendererGpu
